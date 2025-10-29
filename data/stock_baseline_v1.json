@@ -1,0 +1,14 @@
+{
+  "days_recommended": 3,
+  "per_person_daily": {
+    "water_l": 3,
+    "meals": 4,
+    "toilet_bags": 3
+  },
+  "per_person_for_days": {
+    "water_l": 9,
+    "meals": 12,
+    "toilet_bags": 9
+  },
+  "notes": "water_l は 1日1人あたり3L を基準。meals と toilet_bags は仮値（運用で調整可）。"
+}

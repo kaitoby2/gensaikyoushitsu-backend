@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.venv/
+
+# Git / OS
+.git/
+.gitignore
+.DS_Store
+Thumbs.db
+
+# Node / Frontend
+node_modules/
+frontend/
+*.log
+
+# Model weights
+models/
+*.pt
+*.pkl
+*.zip
+
+# Docker自身
+Dockerfile
+docker-compose.yml
