@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-『アプリ減災教室』バックエンド（改）
+『アプリ減災教室』バックエンド（Free向け・ONNX軽量版）
 - 設定の一元化（環境変数）
 - 例外ハンドラ/ログ強化
-- ファイル監視でのホットリロード
-- YOLO遅延ロードの排他制御
-- 入力バリデーション強化
-- 静的配信の柔軟化
+- HotFileでデータのホットリロード
+- 画像診断は ONNXRuntime（ultralytics経由）を使用（torch不要）
+- 数値診断エンドポイントは従来どおり維持
 """
 
 from __future__ import annotations
@@ -30,13 +29,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, conint, confloat
 
-# YOLO は必要時のみロード
-from ultralytics import YOLO
-
-from inventory_vision import analyze_photo_file  # YOLO ラッパ
+# ★ ONNX 版の軽量推論ラッパ（torch不要）
+from inventory_vision import analyze_bottles
 
 # --------------------------------------------------------------------
-# 設定（環境変数）  ← ここを丸ごと置き換え
+# 設定（環境変数）
 # --------------------------------------------------------------------
 APP_NAME    = os.environ.get("APP_NAME", "Disaster Demo API (Water-only)")
 APP_VERSION = os.environ.get("APP_VERSION", "2025.10.29")
@@ -62,10 +59,9 @@ CORS_ALLOW_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = os.environ.get("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
 
-# --- 画像診断モデル（在庫判定） ---
-# Render のコンテナ内に配置する既定パスに統一
-ENABLE_INVENTORY    = os.environ.get("ENABLE_INVENTORY", "0") == "1"             # まずは OFF を既定
-WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", "/app/models/best.pt")
+# --- 画像診断モデル（ONNX） ---
+ENABLE_INVENTORY    = os.environ.get("ENABLE_INVENTORY", "0") == "1"     # まずは OFF を既定
+WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", "/app/models/best.onnx")
 MODEL_PATH          = Path(WATER_BOTTLE_MODEL).resolve()
 if ENABLE_INVENTORY and not MODEL_PATH.exists():
     print(f"[inventory] model not found: {MODEL_PATH} → disabling inventory")
@@ -89,11 +85,11 @@ print("[config] ENABLE_INVENTORY:", ENABLE_INVENTORY)
 print("[config] WATER_BOTTLE_MODEL:", str(MODEL_PATH))
 
 # --------------------------------------------------------------------
-# FastAPI 本体（このブロックも貼り替えOK）
+# FastAPI 本体
 # --------------------------------------------------------------------
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-# ★CORSは一番はじめに適用
+# CORS → 先に適用
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
@@ -110,7 +106,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR), html=False), name="s
 if UNITY_DIR.exists():
     app.mount("/unity", StaticFiles(directory=str(UNITY_DIR), html=False), name="unity")
 if FRONTEND_DIR.exists():
-    # Vite/React のビルド成果物（dist）を置けば /frontend で見られる
     app.mount("/frontend", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 RESULTS_DIR = STATIC_DIR / "results"
@@ -121,7 +116,6 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # --------------------------------------------------------------------
 @app.exception_handler(Exception)
 async def _unhandled_exc(_: Request, exc: Exception):
-    # ここでログだけ出して、ユーザーには汎用メッセージ
     try:
         print(f"[ERROR] {exc!r}")
     except Exception:
@@ -153,13 +147,11 @@ def _read_quiz_csv(path: Path) -> List[dict]:
     return out
 
 class HotFile:
-    """更新時刻を持ってキャッシュ&ホットリロードする簡易ヘルパ"""
     def __init__(self, path: Path, loader):
         self.path = path
         self.loader = loader
         self._mtime = None
         self._cache = None
-
     def get(self):
         mtime = self.path.stat().st_mtime if self.path.exists() else None
         if mtime != self._mtime:
@@ -167,11 +159,10 @@ class HotFile:
             self._mtime = mtime
         return self._cache
 
-# 構成ファイル
 SCENARIOS = HotFile(DATA_DIR / "scenarios_gifu_gotanda.json", lambda p: _read_json(p, {"items": []}))
-STOCK = HotFile(DATA_DIR / "stock_baseline_v1.json", lambda p: _read_json(p, {}))
-QUIZ = HotFile(DATA_DIR / "quiz_v1.csv", _read_quiz_csv)
-RULES = HotFile(DATA_DIR / "advice_rules_v1.json", lambda p: _read_json(p, []))
+STOCK     = HotFile(DATA_DIR / "stock_baseline_v1.json",     lambda p: _read_json(p, {}))
+QUIZ      = HotFile(DATA_DIR / "quiz_v1.csv",                _read_quiz_csv)
+RULES     = HotFile(DATA_DIR / "advice_rules_v1.json",       lambda p: _read_json(p, []))
 
 def _get_stock() -> dict:
     d = dict(STOCK.get() or {})
@@ -190,7 +181,7 @@ class ScoreRequest(BaseModel):
     answers: List[Answer] = Field(default_factory=list)
     inventory_days: confloat(ge=0) = 0
     flood_depth_m: confloat(ge=0) = 0
-    scenario_path: List[dict] = Field(default_factory=list)  # 将来拡張に備えて受ける
+    scenario_path: List[dict] = Field(default_factory=list)
 
 class InventoryAnalyzeBody(BaseModel):
     water_l: confloat(ge=0) = 0
@@ -210,15 +201,15 @@ class Progress(BaseModel):
     last_updated: Optional[str] = None
 
 class SavedResponse(BaseModel):
-    id: str                 # uuid
+    id: str
     user_id: str
     user_name: Optional[str] = None
-    answers: List[dict]     # [{id, value}]
+    answers: List[dict]
     scenario_path: List[dict] = Field(default_factory=list)
     inventory_days: float = 0.0
     score: Optional[dict] = None
     advice: List[str] = Field(default_factory=list)
-    created_at: str         # isoformat
+    created_at: str
 
 class SaveRequest(BaseModel):
     user_id: str
@@ -261,7 +252,6 @@ def _iter_jsonl(path: Path = RESPONSES_PATH) -> Iterable[dict]:
                 continue
 
 def _read_last_for_user(user_id: str) -> Optional[dict]:
-    """末尾から逆走査（大量データでも高速）"""
     if not RESPONSES_PATH.exists():
         return None
     try:
@@ -315,7 +305,6 @@ def _eval_one_numeric(expr: str, ctx: dict) -> bool:
 def evaluate_numeric(cond: str, ctx: dict) -> bool:
     if not cond:
         return False
-    # "A and B" / "A && B" をすべて満たす場合に True
     parts = re.split(r'\s+(?:and|&&)\s+', cond.strip(), flags=re.I)
     return parts and all(_eval_one_numeric(p, ctx) for p in parts)
 
@@ -366,6 +355,10 @@ def root():
 def health():
     return {"ok": True}
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
 @app.get("/version")
 def version():
     return {"name": APP_NAME, "version": APP_VERSION}
@@ -378,7 +371,7 @@ def config():
         "unity_mounted": UNITY_DIR.exists(),
         "frontend_mounted": FRONTEND_DIR.exists(),
         "max_upload_mb": MAX_UPLOAD_MB,
-        "model_path": MODEL_PATH,
+        "model_path": str(MODEL_PATH),
     }
 
 # --------------------------------------------------------------------
@@ -386,7 +379,6 @@ def config():
 # --------------------------------------------------------------------
 @app.get("/scenarios")
 def scenarios(place: str = Query("gifu_gotanda")):
-    # placeの切替に応じてファイル名を変えたい場合は HotFile を動的に作ってもOK
     return SCENARIOS.get()
 
 @app.get("/quiz")
@@ -394,7 +386,7 @@ def quiz():
     return {"items": QUIZ.get()}
 
 # --------------------------------------------------------------------
-# 備蓄診断（数値入力）
+# 備蓄診断（数値入力：従来どおり維持）
 # --------------------------------------------------------------------
 @app.post("/inventory/analyze")
 def inventory_analyze(
@@ -501,6 +493,9 @@ def levels_score(req: ScoreRequest):
 # --------------------------------------------------------------------
 # アドバイス
 # --------------------------------------------------------------------
+def advice_rules(req: ScoreRequest) -> List[str]:
+    return pick_advices_by_rules(req, RULES.get() or [], max_items=MAX_ADVICE)
+
 @app.post("/advice")
 def advice(req: ScoreRequest, top_k: int = Query(MAX_ADVICE, ge=1, le=20)):
     actions = pick_advices_by_rules(req, RULES.get() or [], max_items=top_k)
@@ -578,6 +573,17 @@ def group_progress(group_id: str):
 # --------------------------------------------------------------------
 # 回答・履歴 永続化
 # --------------------------------------------------------------------
+class SavedResponse(BaseModel):
+    id: str
+    user_id: str
+    user_name: Optional[str] = None
+    answers: List[dict]
+    scenario_path: List[dict] = Field(default_factory=list)
+    inventory_days: float = 0.0
+    score: Optional[dict] = None
+    advice: List[str] = Field(default_factory=list)
+    created_at: str
+
 @app.post("/responses/save")
 def responses_save(req: SaveRequest):
     rec = SavedResponse(
@@ -606,25 +612,9 @@ def responses_history(user_id: str, limit: int = 50):
     return out[:max(1, min(limit, 200))]
 
 # --------------------------------------------------------------------
-# 画像アップロード → YOLO で備蓄診断（水）
+# 画像アップロード → ONNX で備蓄診断（水）
 # --------------------------------------------------------------------
-_app_model_lock = Lock()
-app.state.yolo_model = None  # 遅延ロード
-
-def _get_yolo_model() -> YOLO:
-    if app.state.yolo_model is None:
-        with _app_model_lock:
-            if app.state.yolo_model is None:
-                try:
-                    app.state.yolo_model = YOLO(MODEL_PATH)
-                    print(f"[YOLO] Loaded model: {MODEL_PATH}")
-                except Exception as e:
-                    print(f"[YOLO] Failed to load model: {e}")
-                    raise HTTPException(status_code=500, detail=f"YOLO model load failed")
-    return app.state.yolo_model
-
 def _validate_upload(image: UploadFile):
-    # サイズ（Content-Length を信用できないケースがあるため read 後にチェック）
     ext = (Path(image.filename).suffix or "").lower()
     if ext not in ALLOWED_IMAGE_EXTS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
@@ -634,61 +624,55 @@ def _validate_upload(image: UploadFile):
 async def inventory_photo(
     image: UploadFile = File(...),
     persons: int = Form(1),
-    conf_thresh: float = Form(0.5)
+    conf_thresh: float = Form(0.25),
 ):
+    if not ENABLE_INVENTORY:
+        raise HTTPException(status_code=503, detail="Inventory analysis disabled")
+
     if persons < 1:
         persons = 1
 
-    ext = _validate_upload(image)
+    _validate_upload(image)
 
     try:
-        # 受信 → サイズ制限チェック
         content = await image.read()
         size_mb = len(content) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
             raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_MB} MB)")
 
-        # 一時保存
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
+        # ★ ONNX 推論（counts={"n500":..,"n2l":..} を返す）
+        counts = await analyze_bottles(content, str(MODEL_PATH))
+        n500 = int(counts.get("n500", 0))
+        n2l  = int(counts.get("n2l", 0))
 
-        model = _get_yolo_model()
-        out_name = f"{uuid.uuid4().hex}.jpg"
-        out_path = str(RESULTS_DIR / out_name)
+        water_from_image_l = n500 * 0.5 + n2l * 2.0
 
-        res = analyze_photo_file(
-            model,
-            tmp_path,
-            persons=persons,
-            conf_thresh=float(conf_thresh),
-            out_path=out_path
-        )
+        stock = _get_stock()
+        daily_need_per_person = float(stock["per_person_daily"].get("water_l", 3.0))
+        ppl = max(1, int(persons))
+        need_water_per_day = daily_need_per_person * ppl
+        estimated_days = round((water_from_image_l / need_water_per_day), 1) if need_water_per_day > 0 else 0.0
 
-        image_url = f"/static/results/{Path(res['visual_path']).name}"
+        # いまは可視化画像を返していない（必要なら後で追加）
         return {
-            "persons": res["persons"],
-            "counts": res["counts"],
-            "count_500ml": res["counts"]["water_500ml"],
-            "count_2l":   res["counts"]["water_2l"],
-            "total_l": res["total_l"],
-            "estimated_days": res["estimated_days"],
-            "image_url": image_url,
-            "visual_path": image_url
+            "ok": True,
+            "persons": ppl,
+            "counts": {
+                "water_500ml": n500,
+                "water_2l": n2l,
+            },
+            "total_l": water_from_image_l,   # フロント側の overrideLiters 判定で使用
+            "estimated_days": estimated_days,
+            "image_url": "",
+            "visual_path": "",
         }
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        try:
-            if 'tmp_path' in locals():
-                os.unlink(tmp_path)
-        except Exception:
-            pass
 
-# 互換API（未使用）
+# 互換API（未使用だが残しておく）
 @app.post("/inventory/upload")
 async def inventory_upload(file: UploadFile = File(...)):
     return {"filename": file.filename}
