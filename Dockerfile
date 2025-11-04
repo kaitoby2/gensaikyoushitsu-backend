@@ -29,7 +29,7 @@ RUN mkdir -p ${STATIC_DIR}/results
 
 # ---- ONNX モデル取得（GitHub Releases の best.onnx 直リンク）----
 # 必要に応じてビルド引数で差し替え可能: --build-arg ONNX_URL=...
-ARG ONNX_URL="https://github.com/kaitoby2/gensaikyoushitsu-backend/releases/download/v1.0.0/best.onnx"
+ARG ONNX_URL="https://github.com/kaitoby2/gensaikyoushitsu-backend/releases/download/v.1.0.0/best.onnx"
 # 代替URLがあればここに
 ARG ALT_ONNX_URL="https://github.com/kaitoby2/gensaikyoushitsu-backend/releases/download/v.1.0.0/best.onnx"
 
