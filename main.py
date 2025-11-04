@@ -36,51 +36,71 @@ from ultralytics import YOLO
 from inventory_vision import analyze_photo_file  # YOLO ラッパ
 
 # --------------------------------------------------------------------
-# 設定（環境変数）
+# 設定（環境変数）  ← ここを丸ごと置き換え
 # --------------------------------------------------------------------
-APP_NAME = os.environ.get("APP_NAME", "Disaster Demo API (Water-only)")
+APP_NAME    = os.environ.get("APP_NAME", "Disaster Demo API (Water-only)")
 APP_VERSION = os.environ.get("APP_VERSION", "2025.10.29")
 
 # ディレクトリ
-BASE_DIR = Path(__file__).parent.resolve()
-DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data")).resolve()
-STATIC_DIR = Path(os.environ.get("STATIC_DIR", BASE_DIR / "static")).resolve()
-UNITY_DIR = Path(os.environ.get("UNITY_DIR", STATIC_DIR / "unity")).resolve()     # 任意
-FRONTEND_DIR = Path(os.environ.get("FRONTEND_DIR", BASE_DIR / "frontend_dist")).resolve()  # 任意
+BASE_DIR     = Path(__file__).parent.resolve()
+DATA_DIR     = Path(os.environ.get("DATA_DIR",     BASE_DIR / "data")).resolve()
+STATIC_DIR   = Path(os.environ.get("STATIC_DIR",   BASE_DIR / "static")).resolve()
+UNITY_DIR    = Path(os.environ.get("UNITY_DIR",    STATIC_DIR / "unity")).resolve()           # 任意
+FRONTEND_DIR = Path(os.environ.get("FRONTEND_DIR", BASE_DIR / "frontend_dist")).resolve()     # 任意
 
-# CORS
-DEFAULT_CORS = ["http://localhost:5173", "http://127.0.0.1:5173"]
-CORS_ALLOW_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", ",".join(DEFAULT_CORS)).split(",") if o.strip()]
+# --- CORS（本番フロントを既定で許可。ENVで上書き可能） ---
+FRONTEND_PROD = os.environ.get("FRONTEND_PROD", "https://gensaikyoushitsu-frontend.onrender.com")
+DEFAULT_CORS = [
+    FRONTEND_PROD,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+CORS_ALLOW_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("CORS_ALLOW_ORIGINS", ",".join(DEFAULT_CORS)).split(",")
+    if o.strip()
+]
 CORS_ALLOW_CREDENTIALS = os.environ.get("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
 
-# モデル
-MODEL_PATH = os.environ.get(
-    "WATER_BOTTLE_MODEL",
-    "D:/画像認識/2025_0805/runs/train/water_bottle/weights/best.pt",
-)
+# --- 画像診断モデル（在庫判定） ---
+# Render のコンテナ内に配置する既定パスに統一
+ENABLE_INVENTORY    = os.environ.get("ENABLE_INVENTORY", "0") == "1"             # まずは OFF を既定
+WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", "/app/models/best.pt")
+MODEL_PATH          = Path(WATER_BOTTLE_MODEL).resolve()
+if ENABLE_INVENTORY and not MODEL_PATH.exists():
+    print(f"[inventory] model not found: {MODEL_PATH} → disabling inventory")
+    ENABLE_INVENTORY = False
 
 # アップロード制限
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "12"))  # 12MB
-ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+MAX_UPLOAD_MB       = int(os.environ.get("MAX_UPLOAD_MB", "12"))  # 12MB
+ALLOWED_IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # スコア設定
-W_ANSWERS = float(os.environ.get("W_ANSWERS", "0.8"))
-W_INVENTORY = float(os.environ.get("W_INVENTORY", "0.2"))
-SCORE_MAX = int(os.environ.get("SCORE_MAX", "100"))
-TARGET_DAYS = float(os.environ.get("TARGET_DAYS", "3.0"))
-MAX_ADVICE = int(os.environ.get("MAX_ADVICE", "5"))  # /advice?top_k= で上書き可（1~20）
+W_ANSWERS    = float(os.environ.get("W_ANSWERS", "0.8"))
+W_INVENTORY  = float(os.environ.get("W_INVENTORY", "0.2"))
+SCORE_MAX    = int(os.environ.get("SCORE_MAX", "100"))
+TARGET_DAYS  = float(os.environ.get("TARGET_DAYS", "3.0"))
+MAX_ADVICE   = int(os.environ.get("MAX_ADVICE", "5"))  # /advice?top_k= で上書き可（1~20）
+
+# 起動時に設定ダンプ（確認用）
+print("[config] FRONTEND_PROD:", FRONTEND_PROD)
+print("[config] CORS_ALLOW_ORIGINS:", CORS_ALLOW_ORIGINS)
+print("[config] ENABLE_INVENTORY:", ENABLE_INVENTORY)
+print("[config] WATER_BOTTLE_MODEL:", str(MODEL_PATH))
 
 # --------------------------------------------------------------------
-# FastAPI 本体
+# FastAPI 本体（このブロックも貼り替えOK）
 # --------------------------------------------------------------------
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
+# ★CORSは一番はじめに適用
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
