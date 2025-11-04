@@ -1,75 +1,181 @@
-# inventory_vision.py  — Freeプラン向け軽量版（ONNXRuntime使用）
+# inventory_vision.py  —— ultralytics不要版（onnxruntime 直接推論）
 import os
-import asyncio
-import gc
-from io import BytesIO
+import io
+import uuid
+from pathlib import Path
+from typing import Dict, Tuple, List
 
-from PIL import Image
+import cv2
 import numpy as np
-from ultralytics import YOLO  # .onnx を読ませると onnxruntime が使われます
+import onnxruntime as ort
 
-# 画像縮小の最大長辺（環境変数で変更可）
-MAX_SIDE = int(os.environ.get("INVENTORY_MAX_SIDE", "640"))
-CONF     = float(os.environ.get("INVENTORY_CONF", "0.25"))
+# モデルパスの解決（RenderのENVで WATAR_BOTTLE_MODEL=/app/models/best.onnx にしてあればそれを使う）
+MODEL_ONNX = (
+    os.environ.get("MODEL_ONNX")
+    or os.environ.get("WATER_BOTTLE_MODEL")
+    or "/app/models/best.onnx"
+)
 
-# グローバルにモデルを1回だけロード
-_MODEL_SINGLETON = None
-# Free(512MB)でのメモリ急増を避けるため、同時実行は1本に制限
-_LOCK = asyncio.Lock()
+# 出力先（/static/results に書く。main.py 側で STATIC_DIR を /app/static にしている想定）
+STATIC_ROOT = Path(os.environ.get("STATIC_DIR", "/app/static")).resolve()
+RESULTS_DIR = (STATIC_ROOT / "results").resolve()
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# 1本あたりの容量（必要に応じてENVで調整。デフォルト2.0L）
+BOTTLE_LITERS = float(os.environ.get("BOTTLE_LITERS", "2.0"))
 
-def _preprocess(image_bytes: bytes) -> np.ndarray:
-    """画像をRGB化＋長辺MAX_SIDEに縮小してnumpy配列で返す"""
-    im = Image.open(BytesIO(image_bytes)).convert("RGB")
-    im.thumbnail((MAX_SIDE, MAX_SIDE))  # アスペクト比保持で縮小
-    return np.array(im)
-
-
-def _get_model(model_path: str):
-    """ONNXモデルをlazyにロード（.onnxを指定するとonnxruntimeで推論）"""
-    global _MODEL_SINGLETON
-    if _MODEL_SINGLETON is None:
-        _MODEL_SINGLETON = YOLO(model_path)
-    return _MODEL_SINGLETON
+# 推論用セッション
+_session: ort.InferenceSession = None
+_input_name: str = ""
+_input_h = 640
+_input_w = 640
 
 
-def _count_bottles(result) -> dict:
-    """
-    学習時のクラス割当てに合わせて本数を数える。
-    例: class 0 = 500ml, class 1 = 2L （必要に応じて調整）
-    """
-    boxes = result.boxes
-    if boxes is None or boxes.cls is None:
-        return {"n500": 0, "n2l": 0}
-
-    cls = boxes.cls.cpu().numpy().astype(int)
-    n500 = int((cls == 0).sum())
-    n2l  = int((cls == 1).sum())
-    return {"n500": n500, "n2l": n2l}
-
-
-async def analyze_bottles(image_bytes: bytes, model_path: str) -> dict:
-    """
-    画像バイト列を受け取り、500ml/2Lの推定本数を返す。
-    返り値は {'n500': int, 'n2l': int}
-    """
-    img = _preprocess(image_bytes)
-    model = _get_model(model_path)
-
-    # 1リクエストずつ処理してピークメモリを抑える
-    async with _LOCK:
-        results = model.predict(
-            source=img,
-            imgsz=MAX_SIDE,
-            device="cpu",
-            conf=CONF,
-            verbose=False,
+def _load_session():
+    global _session, _input_name
+    if _session is None:
+        if not Path(MODEL_ONNX).exists() or Path(MODEL_ONNX).stat().st_size < 1024:
+            raise FileNotFoundError(
+                f"ONNX model not found or too small: {MODEL_ONNX} "
+                "(check your Dockerfile curl URL or release asset)"
+            )
+        _session = ort.InferenceSession(
+            MODEL_ONNX,
+            providers=["CPUExecutionProvider"],
         )
+        _input_name = _session.get_inputs()[0].name
+        print(f"[inventory_vision] Loaded ONNX: {MODEL_ONNX} as input '{_input_name}'")
 
-    out = _count_bottles(results[0])
 
-    # 明示的に解放を促す
-    del img, results
-    gc.collect()
+def _letterbox(im: np.ndarray, new_shape=(640, 640), color=(114, 114, 114)
+               ) -> Tuple[np.ndarray, float, Tuple[float, float]]:
+    h, w = im.shape[:2]
+    r = min(new_shape[0] / h, new_shape[1] / w)
+    new_unpad = (int(round(w * r)), int(round(h * r)))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+    dw /= 2
+    dh /= 2
+    if (w, h) != new_unpad:
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return im, r, (dw, dh)
 
-    return out
+
+def _xywh2xyxy(x: np.ndarray) -> np.ndarray:
+    # x = [cx, cy, w, h] -> [x1, y1, x2, y2]
+    y = np.zeros_like(x)
+    y[:, 0] = x[:, 0] - x[:, 2] / 2
+    y[:, 1] = x[:, 1] - x[:, 3] / 2
+    y[:, 2] = x[:, 0] + x[:, 2] / 2
+    y[:, 3] = x[:, 1] + x[:, 3] / 2
+    return y
+
+
+def _nms(boxes: np.ndarray, scores: np.ndarray, iou_th=0.45) -> List[int]:
+    # boxes: [N,4] (xyxy), scores: [N]
+    idxs = scores.argsort()[::-1]
+    keep = []
+    while idxs.size > 0:
+        i = idxs[0]
+        keep.append(i)
+        if idxs.size == 1:
+            break
+        ious = _iou(boxes[i], boxes[idxs[1:]])
+        idxs = idxs[1:][ious <= iou_th]
+    return keep
+
+
+def _iou(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    # box: [4], boxes: [M,4] in xyxy
+    x1 = np.maximum(box[0], boxes[:, 0])
+    y1 = np.maximum(box[1], boxes[:, 1])
+    x2 = np.minimum(box[2], boxes[:, 2])
+    y2 = np.minimum(box[3], boxes[:, 3])
+    inter = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
+    area1 = (box[2] - box[0]) * (box[3] - box[1])
+    area2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    return inter / np.maximum(area1 + area2 - inter, 1e-9)
+
+
+def analyze_bottles(file_bytes: bytes) -> Dict:
+    """
+    画像bytesを受け取り、水ボトルの推定本数とリットル数を返す。
+    返却: {
+      "count": int,
+      "estimated_liters": float,
+      "annotated_relpath": str | None
+    }
+    """
+    _load_session()
+
+    # 画像デコード（BGR）
+    img_array = np.frombuffer(file_bytes, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Invalid image bytes.")
+
+    h0, w0 = img.shape[:2]
+
+    # 前処理（レターボックス -> RGB -> CHW -> float32 / 255）
+    lb, r, (dw, dh) = _letterbox(img, (_input_h, _input_w))
+    im = lb[:, :, ::-1]  # BGR -> RGB
+    im = im.transpose(2, 0, 1)  # HWC -> CHW
+    im = np.ascontiguousarray(im, dtype=np.float32) / 255.0
+    im = im[None, :]  # [1,3,640,640]
+
+    # 推論
+    out = _session.run(None, {_input_name: im})[0]  # shape: [1,6,N] （1クラス想定）
+    out = np.squeeze(out, axis=0)                   # [6,N]
+    out = out.T                                     # [N,6] -> [cx,cy,w,h,conf,clsconf]
+
+    if out.size == 0:
+        return {"count": 0, "estimated_liters": 0.0, "annotated_relpath": None}
+
+    # 信頼度（obj_conf * cls_conf）
+    scores = out[:, 4] * out[:, 5]
+
+    # スコアしきい値
+    mask = scores >= float(os.environ.get("BOTTLE_SCORE_TH", "0.35"))
+    out = out[mask]
+    scores = scores[mask]
+    if out.size == 0:
+        return {"count": 0, "estimated_liters": 0.0, "annotated_relpath": None}
+
+    # xywh(640基準) -> xyxy(レターボックス画像基準)
+    boxes = _xywh2xyxy(out[:, :4])
+
+    # レターボックス解除 -> 元画像座標へ
+    boxes[:, [0, 2]] -= dw
+    boxes[:, [1, 3]] -= dh
+    boxes /= r
+
+    # 範囲クリップ
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, w0 - 1)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, h0 - 1)
+
+    # NMS
+    keep = _nms(boxes, scores, iou_th=float(os.environ.get("BOTTLE_NMS_IOU", "0.45")))
+    boxes = boxes[keep]
+    scores = scores[keep]
+
+    count = int(len(boxes))
+    est_liters = round(count * BOTTLE_LITERS, 2)
+
+    # 簡易アノテーションを保存
+    vis = img.copy()
+    for (x1, y1, x2, y2), sc in zip(boxes, scores):
+        p1 = (int(x1), int(y1))
+        p2 = (int(x2), int(y2))
+        cv2.rectangle(vis, p1, p2, (0, 200, 0), 2)
+        cv2.putText(vis, f"bottle {sc:.2f}", (p1[0], max(0, p1[1] - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2, cv2.LINE_AA)
+
+    fname = f"inv_{uuid.uuid4().hex[:8]}.jpg"
+    out_path = RESULTS_DIR / fname
+    cv2.imwrite(str(out_path), vis)
+
+    # /static からの相対を返す（フロントで /static/<path> で表示可能）
+    rel = out_path.relative_to(STATIC_ROOT).as_posix()
+    return {"count": count, "estimated_liters": est_liters, "annotated_relpath": rel}
