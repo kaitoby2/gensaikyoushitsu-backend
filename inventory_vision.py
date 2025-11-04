@@ -1,92 +1,75 @@
-# -*- coding: utf-8 -*-
-from pathlib import Path
-from typing import Tuple, Dict, List
-from PIL import Image, ImageDraw, ImageFont
-from ultralytics import YOLO
+# inventory_vision.py  — Freeプラン向け軽量版（ONNXRuntime使用）
+import os
+import asyncio
+import gc
+from io import BytesIO
 
-# 学習時のクラス名 → 標準ラベル
-CLASS_MAP = {
-    'bottle-water-500ml': 'water_500ml',
-    'bottle-water': 'water_2l'
-}
+from PIL import Image
+import numpy as np
+from ultralytics import YOLO  # .onnx を読ませると onnxruntime が使われます
 
-# 標準ラベルごとの水容量（L）
-VOLUME = {
-    'water_500ml': 0.5,
-    'water_2l': 2.0
-}
+# 画像縮小の最大長辺（環境変数で変更可）
+MAX_SIDE = int(os.environ.get("INVENTORY_MAX_SIDE", "640"))
+CONF     = float(os.environ.get("INVENTORY_CONF", "0.25"))
 
-def detect_bottles(model: YOLO, img_path: str, conf_thresh: float = 0.5) -> List[dict]:
-    results = model(img_path)
-    items = []
-    names = model.names
-    for r in results:
-        for box in r.boxes.data.tolist():
-            x1, y1, x2, y2, conf, cls_id = box
-            if conf < conf_thresh:
-                continue
-            cls_id = int(cls_id)
-            original_class = names[cls_id]
-            std_class = CLASS_MAP.get(original_class)
-            if std_class is None:
-                continue
-            items.append({
-                'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                'class': std_class,
-                'conf': float(conf)
-            })
-    return items
+# グローバルにモデルを1回だけロード
+_MODEL_SINGLETON = None
+# Free(512MB)でのメモリ急増を避けるため、同時実行は1本に制限
+_LOCK = asyncio.Lock()
 
-def estimate_days(items: list, family_size: int) -> Tuple[Dict[str,int], float, float]:
-    counts = {'water_500ml': 0, 'water_2l': 0}
-    total_l = 0.0
-    for it in items:
-        cls = it['class']
-        counts[cls] += 1
-        total_l += VOLUME[cls]
-    daily_need = max(int(family_size), 1) * 3.0  # 1人1日=3L
-    days = total_l / daily_need if daily_need > 0 else 0.0
-    return counts, total_l, days
 
-def _get_font():
-    try:
-        return ImageFont.truetype('arial.ttf', 18)
-    except Exception:
-        return ImageFont.load_default()
+def _preprocess(image_bytes: bytes) -> np.ndarray:
+    """画像をRGB化＋長辺MAX_SIDEに縮小してnumpy配列で返す"""
+    im = Image.open(BytesIO(image_bytes)).convert("RGB")
+    im.thumbnail((MAX_SIDE, MAX_SIDE))  # アスペクト比保持で縮小
+    return np.array(im)
 
-def visualize(img_path: str, items: list, counts: dict,
-              total_l: float, days: float, family_size: int, out_path: str) -> str:
-    img = Image.open(img_path).convert('RGB')
-    draw = ImageDraw.Draw(img)
-    font = _get_font()
 
-    for it in items:
-        x1, y1, x2, y2 = it['bbox']
-        label = f"{it['class']} ({it['conf']:.2f})"
-        tw, th = draw.textlength(label, font=font), 18
-        draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
-        draw.rectangle([x1, y1 - th - 6, x1 + tw + 6, y1], fill='white')
-        draw.text((x1 + 3, y1 - th - 4), label, fill='red', font=font)
+def _get_model(model_path: str):
+    """ONNXモデルをlazyにロード（.onnxを指定するとonnxruntimeで推論）"""
+    global _MODEL_SINGLETON
+    if _MODEL_SINGLETON is None:
+        _MODEL_SINGLETON = YOLO(model_path)
+    return _MODEL_SINGLETON
 
-    summary = f"{family_size} persons: 500ml x {counts['water_500ml']}, 2L x {counts['water_2l']} → {days:.1f} days (Total: {total_l:.1f} L)"
-    w, h = img.size
-    sw = draw.textlength(summary, font=font)
-    sh = 18
-    draw.rectangle([0, h - sh - 12, sw + 12, h], fill='white')
-    draw.text((6, h - sh - 8), summary, fill='black', font=font)
 
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path)
-    return out_path
+def _count_bottles(result) -> dict:
+    """
+    学習時のクラス割当てに合わせて本数を数える。
+    例: class 0 = 500ml, class 1 = 2L （必要に応じて調整）
+    """
+    boxes = result.boxes
+    if boxes is None or boxes.cls is None:
+        return {"n500": 0, "n2l": 0}
 
-def analyze_photo_file(model: YOLO, img_path: str, persons: int, conf_thresh: float, out_path: str) -> dict:
-    items = detect_bottles(model, img_path, conf_thresh=conf_thresh)
-    counts, total_l, days = estimate_days(items, persons)
-    vis_path = visualize(img_path, items, counts, total_l, days, persons, out_path)
-    return {
-        "counts": counts,
-        "total_l": round(total_l, 1),
-        "persons": persons,
-        "estimated_days": round(days, 1),
-        "visual_path": vis_path
-    }
+    cls = boxes.cls.cpu().numpy().astype(int)
+    n500 = int((cls == 0).sum())
+    n2l  = int((cls == 1).sum())
+    return {"n500": n500, "n2l": n2l}
+
+
+async def analyze_bottles(image_bytes: bytes, model_path: str) -> dict:
+    """
+    画像バイト列を受け取り、500ml/2Lの推定本数を返す。
+    返り値は {'n500': int, 'n2l': int}
+    """
+    img = _preprocess(image_bytes)
+    model = _get_model(model_path)
+
+    # 1リクエストずつ処理してピークメモリを抑える
+    async with _LOCK:
+        results = model.predict(
+            source=img,
+            imgsz=MAX_SIDE,
+            device="cpu",
+            conf=CONF,
+            verbose=False,
+        )
+
+    out = _count_bottles(results[0])
+
+    # 明示的に解放を促す
+    del img, results
+    gc.collect()
+
+    return out
