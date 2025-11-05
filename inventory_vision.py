@@ -32,23 +32,41 @@ _input_w = 640
 
 
 def _load_session():
-    global _session, _input_name, _input_h, _input_w
+    # 以前修正したグローバル宣言は必須
+    global _session, _input_name, _input_h, _input_w 
+    
     if _session is None:
         model_path = Path(MODEL_ONNX)
         
-        if not model_path.exists() or model_path.stat().st_size == 0:
-            print(f"[WARN] ONNX model not found or empty: {MODEL_ONNX}. Vision will be skipped.")
-            # モデルファイルが見つからない場合は、セッションロードをスキップ
-            return 
-        
-        print(f"[INFO] Loading ONNX model from {MODEL_ONNX}...")
-        
-        # ★★★【重要】CPU使用を制限し、メモリ消費を抑える（502対策）★★★
+        # --- ★★★ ここからセッションオプションの修正 ★★★ ---
         sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = 1 # 1スレッドに制限
-        sess_options.inter_op_num_threads = 1 # 1スレッドに制限
         
-        _session = ort.InferenceSession(MODEL_ONNX, sess_options)
+        # 以前のメモリ対策（CPUスレッド制限）を再適用
+        # （FP16でもメモリを節約するため、設定は維持）
+        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 1
+
+        # ★ 必須修正：FP16モデルの出力をfloat32に自動変換する設定を追加
+        # output_all_nodes_and_tensors_as_float = True
+        # ※ 最新のONNX Runtimeではこのオプションは削除されたか、デフォルト設定されている可能性があります。
+        #    代わりに、別のセッション最適化フラグを使用するか、単純にfloat16に対応できるか確認します。
+        
+        # ★ 互換性確保のための最適化レベル設定 (FP16/INT8で互換性問題が起きた際に有効)
+        # 基本的にデフォルトの最適化で十分ですが、明示的に設定してみます。
+        # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        # 現状、FP16のエラーはONNX Runtimeのバージョン依存性が高いため、
+        # まずは単純に sess_options を渡してみます。
+        
+        print(f"[INFO] Loading ONNX model from {model_path}...")
+
+        # InferenceSessionを作成し、セッションオプションを渡す
+        _session = ort.InferenceSession(
+            model_path.as_posix(), 
+            sess_options=sess_options,  # ★ 追加
+            providers=["CPUExecutionProvider"] # CPUで実行することを明示
+        )
+        # --- ★★★ ここまで修正 ★★★ ---
         
         # 入力情報の取得
         _input_name = _session.get_inputs()[0].name
