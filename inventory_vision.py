@@ -38,12 +38,12 @@ def _load_session():
         
         if not model_path.exists() or model_path.stat().st_size == 0:
             print(f"[WARN] ONNX model not found or empty: {MODEL_ONNX}. Vision will be skipped.")
-            # モデルが見つからない場合は、セッションロードをスキップし、クラッシュを防ぐ
+            # モデルファイルが見つからない場合は、セッションロードをスキップ
             return 
         
         print(f"[INFO] Loading ONNX model from {MODEL_ONNX}...")
         
-        # CPU使用を強制し、メモリ使用量を減らす
+        # ★★★【重要】CPU使用を制限し、メモリ消費を抑える（502対策）★★★
         sess_options = ort.SessionOptions()
         sess_options.intra_op_num_threads = 1 # 1スレッドに制限
         sess_options.inter_op_num_threads = 1 # 1スレッドに制限
@@ -56,7 +56,6 @@ def _load_session():
         _input_w = shape[2]
         _input_h = shape[3]
         print(f"[INFO] ONNX model loaded. Input: {_input_name} Shape: {_input_w}x{_input_h}")
-
 
 def _letterbox(im: np.ndarray, new_shape=(640, 640), color=(114, 114, 114)
                ) -> Tuple[np.ndarray, float, Tuple[float, float]]:
@@ -111,22 +110,20 @@ def _iou(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
 
 
 def analyze_bottles(file_bytes: bytes) -> Dict:
-    # """
-    # 画像bytesを受け取り、水ボトルの推定本数とリットル数を返す。
-    # 返却: {
-    #  "count": int,
-    #  "estimated_liters": float,
-    #  "annotated_relpath": str | None
-    # }
-    # """
-    # _load_session()
+    """
+    画像bytesを受け取り、水ボトルの推定本数とリットル数を返す。
+    返却: {
+    　"count": int,
+    　"estimated_liters": float,
+      "annotated_relpath": str | None
+     }
+    """
+    _load_session()
 
-    print("[DEBUG] Bypassing ONNX session loading.")
-    return {
-        "count": 1,
-        "estimated_liters": 2.0,
-        "annotated_relpath": ""
-    }
+    # モデルのロードに失敗した場合（_load_session内でモデルファイルが見つからなかった場合）は、ここで処理をスキップ
+    if _session is None:
+        print("[WARN] Vision skipped because ONNX model session is not loaded.")
+        return {"count": 0, "estimated_liters": 0.0, "annotated_relpath": None}
 
     # 画像デコード（BGR）
     img_array = np.frombuffer(file_bytes, dtype=np.uint8)
@@ -194,6 +191,6 @@ def analyze_bottles(file_bytes: bytes) -> Dict:
     out_path = RESULTS_DIR / fname
     cv2.imwrite(str(out_path), vis)
 
-    # /static からの相対を返す（フロントで /static/<path> で表示可能）
+    # 最終的な結果を返す
     rel = out_path.relative_to(STATIC_ROOT).as_posix()
     return {"count": count, "estimated_liters": est_liters, "annotated_relpath": rel}
