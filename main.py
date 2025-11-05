@@ -30,7 +30,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, conint, confloat
 
 # ★ ONNX 版の軽量推論ラッパ（torch不要）
-from inventory_vision import analyze_bottles
+# YOLO は必要時のみロード
+from ultralytics import YOLO
+from inventory_vision import analyze_photo_file  # YOLO ラッパ
 
 # --------------------------------------------------------------------
 # 設定（環境変数）
@@ -61,7 +63,7 @@ CORS_ALLOW_CREDENTIALS = os.environ.get("CORS_ALLOW_CREDENTIALS", "true").lower(
 
 # --- 画像診断モデル（ONNX） ---
 ENABLE_INVENTORY    = os.environ.get("ENABLE_INVENTORY", "0") == "1"     # まずは OFF を既定
-WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", "/app/models/best.onnx")
+WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", "/app/models/best.pt")
 MODEL_PATH          = Path(WATER_BOTTLE_MODEL).resolve()
 if ENABLE_INVENTORY and not MODEL_PATH.exists():
     print(f"[inventory] model not found: {MODEL_PATH} → disabling inventory")
@@ -612,9 +614,25 @@ def responses_history(user_id: str, limit: int = 50):
     return out[:max(1, min(limit, 200))]
 
 # --------------------------------------------------------------------
-# 画像アップロード → ONNX で備蓄診断（水）
+# 画像アップロード → YOLO で備蓄診断（水）
 # --------------------------------------------------------------------
+_app_model_lock = Lock()
+app.state.yolo_model = None  # 遅延ロード
+
+def _get_yolo_model() -> YOLO:
+    if app.state.yolo_model is None:
+        with _app_model_lock:
+            if app.state.yolo_model is None:
+                try:
+                    app.state.yolo_model = YOLO(MODEL_PATH)
+                    print(f"[YOLO] Loaded model: {MODEL_PATH}")
+                except Exception as e:
+                    print(f"[YOLO] Failed to load model: {e}")
+                    raise HTTPException(status_code=500, detail=f"YOLO model load failed")
+    return app.state.yolo_model
+
 def _validate_upload(image: UploadFile):
+    # サイズ（Content-Length を信用できないケースがあるため read 後にチェック）
     ext = (Path(image.filename).suffix or "").lower()
     if ext not in ALLOWED_IMAGE_EXTS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
@@ -623,75 +641,62 @@ def _validate_upload(image: UploadFile):
 @app.post("/inventory/photo")
 async def inventory_photo(
     image: UploadFile = File(...),
-    persons: str = Form("1"), # ★★★ 修正1: int -> str に変更し、文字列として受け取る ★★★
-    conf_thresh: float = Form(0.25),
+    persons: int = Form(1),
+    conf_thresh: float = Form(0.5)
 ):
-    if not ENABLE_INVENTORY:
-        raise HTTPException(status_code=503, detail="Inventory analysis disabled")
+    if persons < 1:
+        persons = 1
 
-    # ★★★ 修正2: personsをintに変換し、数値として扱うための変数 persons_int を作成 ★★★
-    try:
-        # float()を経由し、"1"や"1.0"どちらの文字列にも対応
-        persons_int = int(float(persons)) 
-    except (ValueError, TypeError):
-        persons_int = 1 # 変換失敗時はデフォルト値
-        
-    if persons_int < 1:
-        persons_int = 1
-        
-    _validate_upload(image)
+    ext = _validate_upload(image)
 
     try:
+        # 受信 → サイズ制限チェック
         content = await image.read()
         size_mb = len(content) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
             raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_MB} MB)")
 
-        # ★★★【重要】analyze_bottlesを呼び出す（ダミーコードはすべて削除）★★★
-        result = analyze_bottles(content)
+        # 一時保存
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        # inventory_vision.py はボトル種別を区別しないため、
-        # フロント(App.jsx)が期待する形式に合わせる。
-        # ONNXモデルが検出した全ボトル(count)を「2Lボトル」として扱う
-        n500 = 0
-        n2l  = int(result.get("count", 0))
-        
-        # ONNXモデルが計算した合計リットル数を採用
-        water_from_image_l = float(result.get("estimated_liters", 0.0))
-        
-        # 可視化画像のパスを取得
-        vis_relpath = result.get("annotated_relpath")
-        vis_url = f"/static/{vis_relpath}" if vis_relpath else ""
+        model = _get_yolo_model()
+        out_name = f"{uuid.uuid4().hex}.jpg"
+        out_path = str(RESULTS_DIR / out_name)
 
+        res = analyze_photo_file(
+            model,
+            tmp_path,
+            persons=persons,
+            conf_thresh=float(conf_thresh),
+            out_path=out_path
+        )
 
-        # 必要な日数を計算
-        stock = _get_stock()
-        daily_need_per_person = float(stock["per_person_daily"].get("water_l", 3.0))
-        ppl = max(1, persons_int) # ★★★ 修正3: persons_int を使用
-        need_water_per_day = daily_need_per_person * ppl
-        estimated_days = round((water_from_image_l / need_water_per_day), 1) if need_water_per_day > 0 else 0.0
-
-        # 返却値をフロント(App.jsx)の期待に合わせる
+        image_url = f"/static/results/{Path(res['visual_path']).name}"
         return {
-            "ok": True,
-            "persons": ppl,
-            "counts": {
-                "water_500ml": n500, # 常に 0
-                "water_2l": n2l,     # 検出した総本数
-            },
-            "total_l": water_from_image_l,
-            "estimated_days": estimated_days,
-            "image_url": vis_url,
-            "visual_path": vis_url,
+            "persons": res["persons"],
+            "counts": res["counts"],
+            "count_500ml": res["counts"]["water_500ml"],
+            "count_2l":   res["counts"]["water_2l"],
+            "total_l": res["total_l"],
+            "estimated_days": res["estimated_days"],
+            "image_url": image_url,
+            "visual_path": image_url
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR /inventory/photo] {e!r}") 
-        raise HTTPException(status_code=400, detail=f"Analysis failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        try:
+            if 'tmp_path' in locals():
+                os.unlink(tmp_path)
+        except Exception:
+            pass
 
-# 互換API（未使用だが残しておく）
+# 互換API（未使用）
 @app.post("/inventory/upload")
 async def inventory_upload(file: UploadFile = File(...)):
     return {"filename": file.filename}
