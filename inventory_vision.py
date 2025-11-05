@@ -1,207 +1,132 @@
-# inventory_vision.py  —— ultralytics不要版（onnxruntime 直接推論）
-import os
-import io
-import uuid
+# inventory_vision.py  —— PyTorch/YOLOv8版 (元のロジックを回復)
+# -*- coding: utf-8 -*-
 from pathlib import Path
-from typing import Dict, Tuple, List
+import os
+from typing import Tuple, Dict, List, Optional
+from PIL import Image, ImageDraw, ImageFont
+from ultralytics import YOLO # ★ PyTorch/YOLOv8を再導入
 
-import cv2
-import numpy as np
-import onnxruntime as ort
+# 学習時のクラス名 → 標準ラベル
+CLASS_MAP = {
+    'bottle-water-500ml': 'water_500ml',
+    'bottle-water': 'water_2l'
+}
 
-# モデルパスの解決（RenderのENVで WATAR_BOTTLE_MODEL=/app/models/best.onnx にしてあればそれを使う）
-MODEL_ONNX = (
-    os.environ.get("MODEL_ONNX")
-    or os.environ.get("WATER_BOTTLE_MODEL")
-    or "/app/models/best.onnx"
-)
+# 標準ラベルごとの水容量（L）
+VOLUME = {
+    'water_500ml': 0.5,
+    'water_2l': 2.0
+}
 
-# 出力先（/static/results に書く。main.py 側で STATIC_DIR を /app/static にしている想定）
-STATIC_ROOT = Path(os.environ.get("STATIC_DIR", "/app/static")).resolve()
-RESULTS_DIR = (STATIC_ROOT / "results").resolve()
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# フォントロード（Render環境のフォントパスに依存。適宜調整が必要な場合あり）
+_FONT_PATH = os.environ.get("FONT_PATH") or "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_FONT: Optional[ImageFont.ImageFont] = None
 
-# 1本あたりの容量（必要に応じてENVで調整。デフォルト2.0L）
-BOTTLE_LITERS = float(os.environ.get("BOTTLE_LITERS", "2.0"))
+def _get_font(size=14):
+    """フォントを遅延ロード"""
+    global _FONT
+    if _FONT is None:
+        try:
+            # Render環境で利用可能なフォントパスを使用
+            _FONT = ImageFont.truetype(_FONT_PATH, size)
+        except IOError:
+            print(f"Warning: Font not found at {_FONT_PATH}. Using default font.")
+            _FONT = ImageFont.load_default()
+    return _FONT
 
-# 推論用セッション
-_session: ort.InferenceSession = None
-_input_name: str = ""
-_input_h = 640
-_input_w = 640
-
-
-def _load_session():
-    # ★★★ 修正点B: グローバル変数をすべて宣言 ★★★
-    global _session, _input_name, _input_h, _input_w 
+def detect_bottles(model: YOLO, img_path: str, conf_thresh: float = 0.5) -> List[dict]:
+    """YOLOv8モデルで画像を推論し、検出アイテムのリストを返す"""
+    results = model(img_path)
+    items = []
+    names = model.names
     
-    if _session is None:
-        if not Path(MODEL_ONNX).exists() or Path(MODEL_ONNX).stat().st_size < 1024:
-            raise FileNotFoundError(
-                f"ONNX model not found or too small: {MODEL_ONNX} "
-                "(check your Dockerfile curl URL or release asset)"
-            )
+    for r in results:
+        for box in r.boxes.data.tolist():
+            x1, y1, x2, y2, conf, cls_id = box
+            if conf < conf_thresh:
+                continue
+            
+            cls_id = int(cls_id)
+            original_class = names[cls_id]
+            std_class = CLASS_MAP.get(original_class)
+            
+            if std_class is None:
+                continue
+                
+            items.append({
+                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                'class': std_class,
+                'conf': float(conf),
+            })
+    return items
 
-        # ★★★ 修正点A-1: SessionOptions の作成とメモリ対策の適用 ★★★
-        sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = 1  # メモリ対策（CPUスレッド制限）
-        sess_options.inter_op_num_threads = 1
-        # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL # オプション
+def annotate_and_save(img_path: str, items: List[dict], counts: Dict[str, int], total_l: float, days: float, family_size: int, out_path: str) -> str:
+    """検出結果を画像に描画し、ファイルに保存する"""
+    img = Image.open(img_path).convert('RGB')
+    draw = ImageDraw.Draw(img)
+    font = _get_font()
 
-        print(f"[INFO] Loading ONNX model from {MODEL_ONNX}...")
-
-        # InferenceSessionを作成し、セッションオプションを渡す
-        _session = ort.InferenceSession(
-            MODEL_ONNX,
-            sess_options=sess_options, # ★ sess_options を渡す
-            providers=["CPUExecutionProvider"],
-        )
+    for it in items:
+        x1, y1, x2, y2 = it['bbox']
+        label = f"{it['class']} ({it['conf']:.2f})"
         
-        # 修正点B: 入力情報の取得とグローバル変数への設定
-        _input_name = _session.get_inputs()[0].name
-        shape = _session.get_inputs()[0].shape
+        try: tw = draw.textlength(label, font=font)
+        except AttributeError: tw = len(label) * 8
+        th = 18
         
-        # グローバル変数 _input_w, _input_h に値を設定
-        _input_w = shape[2]
-        _input_h = shape[3]
+        draw.rectangle([x1, y1, x2, y2], outline='red', width=2)
+        draw.rectangle([x1, y1 - th - 6, x1 + tw + 6, y1], fill='white')
+        draw.text((x1 + 3, y1 - th - 4), label, fill='red', font=font)
+
+    summary = f"{family_size} persons: 500ml x {counts['water_500ml']}, 2L x {counts['water_2l']} → {days:.1f} days (Total: {total_l:.1f} L)"
+    w, h = img.size
+    
+    try: sw = draw.textlength(summary, font=font)
+    except AttributeError: sw = len(summary) * 8
         
-        print(f"[inventory_vision] Loaded ONNX: {MODEL_ONNX} as input '{_input_name}'")
-        print(f"[INFO] ONNX model loaded. Input: {_input_name} Shape: {_input_w}x{_input_h}")
+    sh = 18
+    draw.rectangle([0, h - sh - 12, sw + 12, h], fill='white')
+    draw.text((6, h - sh - 8), summary, fill='black', font=font)
 
-def _letterbox(im: np.ndarray, new_shape=(640, 640), color=(114, 114, 114)
-               ) -> Tuple[np.ndarray, float, Tuple[float, float]]:
-    h, w = im.shape[:2]
-    r = min(new_shape[0] / h, new_shape[1] / w)
-    new_unpad = (int(round(w * r)), int(round(h * r)))
-    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
-    dw /= 2
-    dh /= 2
-    if (w, h) != new_unpad:
-        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return im, r, (dw, dh)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, format='JPEG', quality=95)
+    return out_path
 
+def analyze_photo_file(model: YOLO, img_path: str, persons: int, conf_thresh: float, out_path: str) -> Dict:
+    """YOLOv8推論と結果の集計を行うメイン関数"""
+    
+    items = detect_bottles(model, img_path, conf_thresh)
+    
+    # クラスごとのカウント
+    counts: Dict[str, int] = {}
+    for it in items:
+        counts[it['class']] = counts.get(it['class'], 0) + 1
+        
+    n500 = counts.get('water_500ml', 0)
+    n2l = counts.get('water_2l', 0)
 
-def _xywh2xyxy(x: np.ndarray) -> np.ndarray:
-    # x = [cx, cy, w, h] -> [x1, y1, x2, y2]
-    y = np.zeros_like(x)
-    y[:, 0] = x[:, 0] - x[:, 2] / 2
-    y[:, 1] = x[:, 1] - x[:, 3] / 2
-    y[:, 2] = x[:, 0] + x[:, 2] / 2
-    y[:, 3] = x[:, 1] + x[:, 3] / 2
-    return y
+    # 合計容量計算
+    water_from_image_l = n500 * VOLUME['water_500ml'] + n2l * VOLUME['water_2l']
+    
+    # 必要な日数を計算 (main.pyのデフォルト値を使用して概算)
+    DAILY_NEED_PER_PERSON_L = 3.0
+    need_water_per_day = DAILY_NEED_PER_PERSON_L * max(1, persons)
+    estimated_days = round((water_from_image_l / need_water_per_day), 1) if need_water_per_day > 0 else 0.0
 
+    # 画像に描画して保存
+    visual_path = annotate_and_save(
+        img_path, items, 
+        {'water_500ml': n500, 'water_2l': n2l}, 
+        water_from_image_l, 
+        estimated_days, 
+        persons, 
+        out_path
+    )
 
-def _nms(boxes: np.ndarray, scores: np.ndarray, iou_th=0.45) -> List[int]:
-    # boxes: [N,4] (xyxy), scores: [N]
-    idxs = scores.argsort()[::-1]
-    keep = []
-    while idxs.size > 0:
-        i = idxs[0]
-        keep.append(i)
-        if idxs.size == 1:
-            break
-        ious = _iou(boxes[i], boxes[idxs[1:]])
-        idxs = idxs[1:][ious <= iou_th]
-    return keep
-
-
-def _iou(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
-    # box: [4], boxes: [M,4] in xyxy
-    x1 = np.maximum(box[0], boxes[:, 0])
-    y1 = np.maximum(box[1], boxes[:, 1])
-    x2 = np.minimum(box[2], boxes[:, 2])
-    y2 = np.minimum(box[3], boxes[:, 3])
-    inter = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
-    area1 = (box[2] - box[0]) * (box[3] - box[1])
-    area2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    return inter / np.maximum(area1 + area2 - inter, 1e-9)
-
-
-def analyze_bottles(file_bytes: bytes) -> Dict:
-    """
-    画像bytesを受け取り、水ボトルの推定本数とリットル数を返す。
-    返却: {
-    　"count": int,
-    　"estimated_liters": float,
-      "annotated_relpath": str | None
-     }
-    """
-    _load_session()
-
-    # モデルのロードに失敗した場合（_load_session内でモデルファイルが見つからなかった場合）は、ここで処理をスキップ
-    if _session is None:
-        print("[WARN] Vision skipped because ONNX model session is not loaded.")
-        return {"count": 0, "estimated_liters": 0.0, "annotated_relpath": None}
-
-    # 画像デコード（BGR）
-    img_array = np.frombuffer(file_bytes, dtype=np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Invalid image bytes.")
-
-    h0, w0 = img.shape[:2]
-
-    # 前処理（レターボックス -> RGB -> CHW -> float32 / 255）
-    lb, r, (dw, dh) = _letterbox(img, (_input_h, _input_w))
-    im = lb[:, :, ::-1]  # BGR -> RGB
-    im = im.transpose(2, 0, 1)  # HWC -> CHW
-    im = np.ascontiguousarray(im, dtype=np.float32) / 255.0
-    im = im[None, :]  # [1,3,640,640]
-
-    # 推論
-    out = _session.run(None, {_input_name: im})[0]  # shape: [1,6,N] （1クラス想定）
-    out = np.squeeze(out, axis=0)                   # [6,N]
-    out = out.T                                     # [N,6] -> [cx,cy,w,h,conf,clsconf]
-
-    if out.size == 0:
-        return {"count": 0, "estimated_liters": 0.0, "annotated_relpath": None}
-
-    # 信頼度（obj_conf * cls_conf）
-    scores = out[:, 4] * out[:, 5]
-
-    # スコアしきい値
-    mask = scores >= float(os.environ.get("BOTTLE_SCORE_TH", "0.35"))
-    out = out[mask]
-    scores = scores[mask]
-    if out.size == 0:
-        return {"count": 0, "estimated_liters": 0.0, "annotated_relpath": None}
-
-    # xywh(640基準) -> xyxy(レターボックス画像基準)
-    boxes = _xywh2xyxy(out[:, :4])
-
-    # レターボックス解除 -> 元画像座標へ
-    boxes[:, [0, 2]] -= dw
-    boxes[:, [1, 3]] -= dh
-    boxes /= r
-
-    # 範囲クリップ
-    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, w0 - 1)
-    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, h0 - 1)
-
-    # NMS
-    keep = _nms(boxes, scores, iou_th=float(os.environ.get("BOTTLE_NMS_IOU", "0.45")))
-    boxes = boxes[keep]
-    scores = scores[keep]
-
-    count = int(len(boxes))
-    est_liters = round(count * BOTTLE_LITERS, 2)
-
-    # 簡易アノテーションを保存
-    vis = img.copy()
-    for (x1, y1, x2, y2), sc in zip(boxes, scores):
-        p1 = (int(x1), int(y1))
-        p2 = (int(x2), int(y2))
-        cv2.rectangle(vis, p1, p2, (0, 200, 0), 2)
-        cv2.putText(vis, f"bottle {sc:.2f}", (p1[0], max(0, p1[1] - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2, cv2.LINE_AA)
-
-    fname = f"inv_{uuid.uuid4().hex[:8]}.jpg"
-    out_path = RESULTS_DIR / fname
-    cv2.imwrite(str(out_path), vis)
-
-    # 最終的な結果を返す
-    rel = out_path.relative_to(STATIC_ROOT).as_posix()
-    return {"count": count, "estimated_liters": est_liters, "annotated_relpath": rel}
+    return {
+        "persons": persons,
+        "counts": {'water_500ml': n500, 'water_2l': n2l},
+        "total_l": water_from_image_l,
+        "estimated_days": estimated_days,
+        "visual_path": visual_path,
+    }
