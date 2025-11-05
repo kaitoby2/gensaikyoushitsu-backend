@@ -100,15 +100,22 @@ def _iou(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
 
 
 def analyze_bottles(file_bytes: bytes) -> Dict:
-    """
-    画像bytesを受け取り、水ボトルの推定本数とリットル数を返す。
-    返却: {
-      "count": int,
-      "estimated_liters": float,
-      "annotated_relpath": str | None
+    # """
+    # 画像bytesを受け取り、水ボトルの推定本数とリットル数を返す。
+    # 返却: {
+    #  "count": int,
+    #  "estimated_liters": float,
+    #  "annotated_relpath": str | None
+    # }
+    # """
+    # _load_session()
+
+    print("[DEBUG] Bypassing ONNX session loading.")
+    return {
+        "count": 1,
+        "estimated_liters": 2.0,
+        "annotated_relpath": ""
     }
-    """
-    _load_session()
 
     # 画像デコード（BGR）
     img_array = np.frombuffer(file_bytes, dtype=np.uint8)
