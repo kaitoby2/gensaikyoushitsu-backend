@@ -624,7 +624,7 @@ def _validate_upload(image: UploadFile):
 async def inventory_photo(
     image: UploadFile = File(...),
     persons: int = Form(1),
-    conf_thresh: float = Form(0.25),  # この引数は analyze_bottles に渡されませんが、API定義として残します
+    conf_thresh: float = Form(0.25),
 ):
     if not ENABLE_INVENTORY:
         raise HTTPException(status_code=503, detail="Inventory analysis disabled")
@@ -635,13 +635,13 @@ async def inventory_photo(
     _validate_upload(image)
 
     try:
-        content = await image.read() # ← AI処理を試すため、一時的に読み込みを停止
+        content = await image.read()
         size_mb = len(content) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
             raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_MB} MB)")
 
-        # ★ ONNX 推論（result={"count": N, "estimated_liters": L, "annotated_relpath": str} を返す）
-        result = analyze_bottles(content) # ← 【重要】AIモデルの呼び出しを一時的に停止
+        # ★★★【重要】analyze_bottlesを呼び出す（ダミーコードはすべて削除）★★★
+        result = analyze_bottles(content)
 
         # inventory_vision.py はボトル種別を区別しないため、
         # フロント(App.jsx)が期待する形式に合わせる。
@@ -652,9 +652,8 @@ async def inventory_photo(
         # ONNXモデルが計算した合計リットル数を採用
         water_from_image_l = float(result.get("estimated_liters", 0.0))
         
-        # 可視化画像のパスを取得 (例: "results/inv_....jpg")
+        # 可視化画像のパスを取得
         vis_relpath = result.get("annotated_relpath")
-        # フロントエンドが API_BASE と結合できるよう、先頭に /static/ を付与
         vis_url = f"/static/{vis_relpath}" if vis_relpath else ""
 
 
@@ -662,7 +661,7 @@ async def inventory_photo(
         stock = _get_stock()
         daily_need_per_person = float(stock["per_person_daily"].get("water_l", 3.0))
         ppl = max(1, int(persons))
-        need_water_per_day = daily_need_per_person * ppl
+        need_water_per day = daily_need_per_person * ppl
         estimated_days = round((water_from_image_l / need_water_per_day), 1) if need_water_per_day > 0 else 0.0
 
         # 返却値をフロント(App.jsx)の期待に合わせる
@@ -673,16 +672,15 @@ async def inventory_photo(
                 "water_500ml": n500, # 常に 0
                 "water_2l": n2l,     # 検出した総本数
             },
-            "total_l": water_from_image_l,   # フロント側の overrideLiters 判定で使用
+            "total_l": water_from_image_l,
             "estimated_days": estimated_days,
-            "image_url": vis_url,      # App.jsx: response.image_url
-            "visual_path": vis_url,    # App.jsx: response.visual_path
+            "image_url": vis_url,
+            "visual_path": vis_url,
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        # エラーログをコンソールに出力
         print(f"[ERROR /inventory/photo] {e!r}") 
         raise HTTPException(status_code=400, detail=f"Analysis failed: {str(e)}")
 
