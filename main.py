@@ -661,7 +661,7 @@ async def inventory_photo(
         stock = _get_stock()
         daily_need_per_person = float(stock["per_person_daily"].get("water_l", 3.0))
         ppl = max(1, int(persons))
-        need_water_per day = daily_need_per_person * ppl
+        need_water_per_day = daily_need_per_person * ppl
         estimated_days = round((water_from_image_l / need_water_per_day), 1) if need_water_per_day > 0 else 0.0
 
         # 返却値をフロント(App.jsx)の期待に合わせる
