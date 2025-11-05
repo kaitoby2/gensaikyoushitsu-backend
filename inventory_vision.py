@@ -32,19 +32,30 @@ _input_w = 640
 
 
 def _load_session():
-    global _session, _input_name
+    global _session, _input_name, _input_h, _input_w
     if _session is None:
-        if not Path(MODEL_ONNX).exists() or Path(MODEL_ONNX).stat().st_size < 1024:
-            raise FileNotFoundError(
-                f"ONNX model not found or too small: {MODEL_ONNX} "
-                "(check your Dockerfile curl URL or release asset)"
-            )
-        _session = ort.InferenceSession(
-            MODEL_ONNX,
-            providers=["CPUExecutionProvider"],
-        )
+        model_path = Path(MODEL_ONNX)
+        
+        if not model_path.exists() or model_path.stat().st_size == 0:
+            print(f"[WARN] ONNX model not found or empty: {MODEL_ONNX}. Vision will be skipped.")
+            # モデルが見つからない場合は、セッションロードをスキップし、クラッシュを防ぐ
+            return 
+        
+        print(f"[INFO] Loading ONNX model from {MODEL_ONNX}...")
+        
+        # CPU使用を強制し、メモリ使用量を減らす
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 1 # 1スレッドに制限
+        sess_options.inter_op_num_threads = 1 # 1スレッドに制限
+        
+        _session = ort.InferenceSession(MODEL_ONNX, sess_options)
+        
+        # 入力情報の取得
         _input_name = _session.get_inputs()[0].name
-        print(f"[inventory_vision] Loaded ONNX: {MODEL_ONNX} as input '{_input_name}'")
+        shape = _session.get_inputs()[0].shape
+        _input_w = shape[2]
+        _input_h = shape[3]
+        print(f"[INFO] ONNX model loaded. Input: {_input_name} Shape: {_input_w}x{_input_h}")
 
 
 def _letterbox(im: np.ndarray, new_shape=(640, 640), color=(114, 114, 114)
