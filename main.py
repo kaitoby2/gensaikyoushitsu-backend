@@ -623,15 +623,22 @@ def _validate_upload(image: UploadFile):
 @app.post("/inventory/photo")
 async def inventory_photo(
     image: UploadFile = File(...),
-    persons: int = Form(1),
+    persons: str = Form("1"), # ★★★ 修正1: int -> str に変更し、文字列として受け取る ★★★
     conf_thresh: float = Form(0.25),
 ):
     if not ENABLE_INVENTORY:
         raise HTTPException(status_code=503, detail="Inventory analysis disabled")
 
-    if persons < 1:
-        persons = 1
-
+    # ★★★ 修正2: personsをintに変換し、数値として扱うための変数 persons_int を作成 ★★★
+    try:
+        # float()を経由し、"1"や"1.0"どちらの文字列にも対応
+        persons_int = int(float(persons)) 
+    except (ValueError, TypeError):
+        persons_int = 1 # 変換失敗時はデフォルト値
+        
+    if persons_int < 1:
+        persons_int = 1
+        
     _validate_upload(image)
 
     try:
@@ -660,7 +667,7 @@ async def inventory_photo(
         # 必要な日数を計算
         stock = _get_stock()
         daily_need_per_person = float(stock["per_person_daily"].get("water_l", 3.0))
-        ppl = max(1, int(persons))
+        ppl = max(1, persons_int) # ★★★ 修正3: persons_int を使用
         need_water_per_day = daily_need_per_person * ppl
         estimated_days = round((water_from_image_l / need_water_per_day), 1) if need_water_per_day > 0 else 0.0
 
