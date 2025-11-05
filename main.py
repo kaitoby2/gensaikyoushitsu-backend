@@ -635,22 +635,13 @@ async def inventory_photo(
     _validate_upload(image)
 
     try:
-        # content = await image.read() # ← AI処理を試すため、一時的に読み込みを停止
-        # size_mb = len(content) / (1024 * 1024)
-        # if size_mb > MAX_UPLOAD_MB:
-        #    raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_MB} MB)")
+        content = await image.read() # ← AI処理を試すため、一時的に読み込みを停止
+        size_mb = len(content) / (1024 * 1024)
+        if size_mb > MAX_UPLOAD_MB:
+            raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_MB} MB)")
 
         # ★ ONNX 推論（result={"count": N, "estimated_liters": L, "annotated_relpath": str} を返す）
-        # result = analyze_bottles(content) # ← 【重要】AIモデルの呼び出しを一時的に停止
-
-        # ↓↓↓ 動作確認のため、ダミーの(偽の)結果を挿入します ↓↓↓
-        print("[DEBUG] Bypassing ONNX model. Returning mock data.")
-        result = {
-            "count": 3,  # テスト用に「3本」
-            "estimated_liters": 6.0, # テスト用に「6.0L」
-            "annotated_relpath": ""  # 画像パスは空
-        }
-        # ↑↑↑ ここまで挿入 ↑↑↑
+        result = analyze_bottles(content) # ← 【重要】AIモデルの呼び出しを一時的に停止
 
         # inventory_vision.py はボトル種別を区別しないため、
         # フロント(App.jsx)が期待する形式に合わせる。
