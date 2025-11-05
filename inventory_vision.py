@@ -32,47 +32,40 @@ _input_w = 640
 
 
 def _load_session():
-    # 以前修正したグローバル宣言は必須
+    # ★★★ 修正点B: グローバル変数をすべて宣言 ★★★
     global _session, _input_name, _input_h, _input_w 
     
     if _session is None:
-        model_path = Path(MODEL_ONNX)
-        
-        # --- ★★★ ここからセッションオプションの修正 ★★★ ---
-        sess_options = ort.SessionOptions()
-        
-        # 以前のメモリ対策（CPUスレッド制限）を再適用
-        # （FP16でもメモリを節約するため、設定は維持）
-        sess_options.intra_op_num_threads = 1
-        sess_options.inter_op_num_threads = 1
+        if not Path(MODEL_ONNX).exists() or Path(MODEL_ONNX).stat().st_size < 1024:
+            raise FileNotFoundError(
+                f"ONNX model not found or too small: {MODEL_ONNX} "
+                "(check your Dockerfile curl URL or release asset)"
+            )
 
-        # ★ 必須修正：FP16モデルの出力をfloat32に自動変換する設定を追加
-        # output_all_nodes_and_tensors_as_float = True
-        # ※ 最新のONNX Runtimeではこのオプションは削除されたか、デフォルト設定されている可能性があります。
-        #    代わりに、別のセッション最適化フラグを使用するか、単純にfloat16に対応できるか確認します。
-        
-        # ★ 互換性確保のための最適化レベル設定 (FP16/INT8で互換性問題が起きた際に有効)
-        # 基本的にデフォルトの最適化で十分ですが、明示的に設定してみます。
-        # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        # 現状、FP16のエラーはONNX Runtimeのバージョン依存性が高いため、
-        # まずは単純に sess_options を渡してみます。
-        
-        print(f"[INFO] Loading ONNX model from {model_path}...")
+        # ★★★ 修正点A-1: SessionOptions の作成とメモリ対策の適用 ★★★
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 1  # メモリ対策（CPUスレッド制限）
+        sess_options.inter_op_num_threads = 1
+        # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL # オプション
+
+        print(f"[INFO] Loading ONNX model from {MODEL_ONNX}...")
 
         # InferenceSessionを作成し、セッションオプションを渡す
         _session = ort.InferenceSession(
-            model_path.as_posix(), 
-            sess_options=sess_options,  # ★ 追加
-            providers=["CPUExecutionProvider"] # CPUで実行することを明示
+            MODEL_ONNX,
+            sess_options=sess_options, # ★ sess_options を渡す
+            providers=["CPUExecutionProvider"],
         )
-        # --- ★★★ ここまで修正 ★★★ ---
         
-        # 入力情報の取得
+        # 修正点B: 入力情報の取得とグローバル変数への設定
         _input_name = _session.get_inputs()[0].name
         shape = _session.get_inputs()[0].shape
+        
+        # グローバル変数 _input_w, _input_h に値を設定
         _input_w = shape[2]
         _input_h = shape[3]
+        
+        print(f"[inventory_vision] Loaded ONNX: {MODEL_ONNX} as input '{_input_name}'")
         print(f"[INFO] ONNX model loaded. Input: {_input_name} Shape: {_input_w}x{_input_h}")
 
 def _letterbox(im: np.ndarray, new_shape=(640, 640), color=(114, 114, 114)
