@@ -30,9 +30,10 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, conint, confloat
 
-# YOLO (Ultralytics) は必要時のみロード
-from ultralytics import YOLO
+# 画像解析ラッパ（Ultralyticsは _get_yolo_model 内で遅延import）
 from inventory_vision import analyze_photo_file
+
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # --------------------------------------------------------------------
 # 設定（環境変数）
@@ -119,14 +120,18 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # --------------------------------------------------------------------
 # 例外ハンドラ
 # --------------------------------------------------------------------
+
+# HTTPエラーはそのまま返す（デフォルト動作に近い形）
+@app.exception_handler(StarletteHTTPException)
+async def _http_exc_handler(_: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+# 想定外エラーだけ500でまとめる
 @app.exception_handler(Exception)
 async def _unhandled_exc(_: Request, exc: Exception):
-    try:
-        print(f"[ERROR] {exc!r}")
-    except Exception:
-        pass
+    print(f"[ERROR] {exc!r}")
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-
+  
 # --------------------------------------------------------------------
 # データ読み込み（ホットリロード）
 # --------------------------------------------------------------------
@@ -174,6 +179,28 @@ def _get_stock() -> dict:
     ppd = d.setdefault("per_person_daily", {})
     ppd["water_l"] = float(ppd.get("water_l", 3))
     return d
+
+# ---- シナリオ読み込み（placeごと） ----
+SCEN_CACHE: Dict[str, dict] = {}
+
+def load_scenarios(place: str) -> dict:
+    """
+    data/scenarios_{place}.json を読み込み、常に {"items":[...]} を返す。
+    ファイルが無い／壊れている場合は {"items": []}。
+    """
+    p = DATA_DIR / f"scenarios_{place}.json"
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"[scenarios] load failed: {p} ({e})")
+        return {"items": []}
+
+    items = raw.get("items")
+    if isinstance(items, list):
+        return {"items": items}
+    # 万一 items が無い/不正なら空配列で返す（UIは落ちない）
+    return {"items": []}
 
 # --------------------------------------------------------------------
 # Pydantic モデル
@@ -377,6 +404,7 @@ def version():
 def config():
     return {
         "cors": CORS_ALLOW_ORIGINS,
+        "data_dir": str(DATA_DIR),            # ← 追加
         "static": str(STATIC_DIR),
         "unity_mounted": UNITY_DIR.exists(),
         "frontend_mounted": FRONTEND_DIR.exists(),
@@ -395,7 +423,6 @@ def scenarios(place: str = Query("gifu_gotanda")):
     # キャッシュに無い、または None/不正形なら再読込
     if not isinstance(data, dict) or not data:
         loaded = load_scenarios(place) or {}
-        # 形をそろえる（itemsが無い・不正なら空配列にする）
         items = loaded.get("items")
         if not isinstance(items, list):
             loaded = {"items": []}
@@ -627,7 +654,7 @@ def responses_history(user_id: str, limit: int = 50):
 _app_model_lock = Lock()
 app.state.yolo_model = None  # 遅延ロード
 
-def _get_yolo_model() -> YOLO:
+def _get_yolo_model() -> "YOLO":  # ← from __future__ import annotations があるので文字列でOK
     if not ENABLE_INVENTORY:
         raise HTTPException(status_code=503, detail="Inventory analysis is disabled")
     if not MODEL_PATH.exists():
@@ -636,6 +663,8 @@ def _get_yolo_model() -> YOLO:
         with _app_model_lock:
             if app.state.yolo_model is None:
                 try:
+                    # ここで初めて import（無い環境でも起動は成功する）
+                    from ultralytics import YOLO  # noqa
                     app.state.yolo_model = YOLO(MODEL_PATH)
                     print(f"[YOLO] Loaded model: {MODEL_PATH}")
                 except Exception as e:
@@ -709,6 +738,11 @@ async def inventory_photo(
 @app.post("/inventory/upload")
 async def inventory_upload(file: UploadFile = File(...)):
     return {"filename": file.filename}
+
+@app.options("/{rest_of_path:path}")
+def any_options(rest_of_path: str):
+    # CORSMiddleware が自動でヘッダ付けるので 200 を返すだけでよい
+    return JSONResponse({"ok": True})
 
 # --------------------------------------------------------------------
 # 管理者 API（X-Admin-Token ヘッダ必須）
