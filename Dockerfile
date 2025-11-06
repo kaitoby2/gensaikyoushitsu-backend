@@ -21,6 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---- Python 依存 ----
 COPY requirements.txt ./
 RUN python -m pip install --upgrade pip \
+    # ← ここで CPU 版の torch/torchvision をインストール（CUDAを一切入れない）
+ && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+      torch==2.4.0 torchvision==0.19.0 \
+    # 残りは通常のPyPIから
  && pip install --no-cache-dir -r requirements.txt
 
 # ---- アプリ本体 ----
