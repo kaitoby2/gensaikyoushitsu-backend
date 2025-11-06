@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-『アプリ減災教室』バックエンド（Free向け・ONNX軽量版）
-- 設定の一元化（環境変数）
-- 例外ハンドラ/ログ強化
-- HotFileでデータのホットリロード
-- 画像診断は ONNXRuntime（ultralytics経由）を使用（torch不要）
-- 数値診断エンドポイントは従来どおり維持
+『アプリ減災教室』バックエンド（管理者モード + group_id 永続化 対応版）
+- 回答レコードに user_id / answers / advice / group_id / score / created_at を JSONL で保存
+- 管理者トークン（X-Admin-Token）で認証し、管理者用 API を提供
+- 画像解析は YOLO(ONNX/PT) ラッパ経由で提供（inventory_vision.analyze_photo_file）
+
+起動例：
+  ADMIN_TOKEN=secret123 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
@@ -29,23 +30,25 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, conint, confloat
 
-# ★ ONNX 版の軽量推論ラッパ（torch不要）
-# YOLO は必要時のみロード
+# YOLO (Ultralytics) は必要時のみロード
 from ultralytics import YOLO
-from inventory_vision import analyze_photo_file  # YOLO ラッパ
+from inventory_vision import analyze_photo_file
 
 # --------------------------------------------------------------------
 # 設定（環境変数）
 # --------------------------------------------------------------------
 APP_NAME    = os.environ.get("APP_NAME", "Disaster Demo API (Water-only)")
-APP_VERSION = os.environ.get("APP_VERSION", "2025.10.29")
+APP_VERSION = os.environ.get("APP_VERSION", "2025.11.06")
+
+# 管理者トークン（空の場合は実質無効。公開環境では必ず設定してください）
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 # ディレクトリ
 BASE_DIR     = Path(__file__).parent.resolve()
 DATA_DIR     = Path(os.environ.get("DATA_DIR",     BASE_DIR / "data")).resolve()
 STATIC_DIR   = Path(os.environ.get("STATIC_DIR",   BASE_DIR / "static")).resolve()
-UNITY_DIR    = Path(os.environ.get("UNITY_DIR",    STATIC_DIR / "unity")).resolve()           # 任意
-FRONTEND_DIR = Path(os.environ.get("FRONTEND_DIR", BASE_DIR / "frontend_dist")).resolve()     # 任意
+UNITY_DIR    = Path(os.environ.get("UNITY_DIR",    STATIC_DIR / "unity")).resolve()
+FRONTEND_DIR = Path(os.environ.get("FRONTEND_DIR", BASE_DIR / "frontend_dist")).resolve()
 
 # --- CORS（本番フロントを既定で許可。ENVで上書き可能） ---
 FRONTEND_PROD = os.environ.get("FRONTEND_PROD", "https://gensaikyoushitsu-frontend.onrender.com")
@@ -61,9 +64,9 @@ CORS_ALLOW_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = os.environ.get("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
 
-# --- 画像診断モデル（ONNX） ---
-ENABLE_INVENTORY    = os.environ.get("ENABLE_INVENTORY", "0") == "1"     # まずは OFF を既定
-WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", "/app/models/best.pt")
+# --- 画像診断モデル（ONNX/PT） ---
+ENABLE_INVENTORY    = os.environ.get("ENABLE_INVENTORY", "0") == "1"  # 既定は OFF
+WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", str(BASE_DIR / "models" / "best.onnx"))
 MODEL_PATH          = Path(WATER_BOTTLE_MODEL).resolve()
 if ENABLE_INVENTORY and not MODEL_PATH.exists():
     print(f"[inventory] model not found: {MODEL_PATH} → disabling inventory")
@@ -114,7 +117,7 @@ RESULTS_DIR = STATIC_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # --------------------------------------------------------------------
-# ログ + 例外ハンドラ
+# 例外ハンドラ
 # --------------------------------------------------------------------
 @app.exception_handler(Exception)
 async def _unhandled_exc(_: Request, exc: Exception):
@@ -125,7 +128,7 @@ async def _unhandled_exc(_: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 # --------------------------------------------------------------------
-# データ読み込み（ホットリロード対応）
+# データ読み込み（ホットリロード）
 # --------------------------------------------------------------------
 def _read_json(path: Path, default):
     try:
@@ -141,8 +144,8 @@ def _read_quiz_csv(path: Path) -> List[dict]:
         reader = csv.DictReader(f)
         for r in reader:
             try:
-                r["weight"] = int(r["weight"])
-                r["no"] = int(r["no"])
+                r["weight"] = int(r["weight"])  # 型を保証
+                r["no"] = int(r["no"])         # 型を保証
                 out.append(r)
             except Exception:
                 continue
@@ -202,6 +205,17 @@ class Progress(BaseModel):
     advice: List[AdviceItem] = Field(default_factory=list)
     last_updated: Optional[str] = None
 
+class SaveRequest(BaseModel):
+    user_id: str
+    user_name: Optional[str] = None
+    answers: List[Answer] = Field(default_factory=list)
+    scenario_path: List[dict] = Field(default_factory=list)
+    inventory_days: confloat(ge=0) = 0
+    score: Optional[dict] = None
+    advice: List[str] = Field(default_factory=list)
+    # ★ 所属チームID（任意）
+    group_id: Optional[str] = None
+
 class SavedResponse(BaseModel):
     id: str
     user_id: str
@@ -211,16 +225,9 @@ class SavedResponse(BaseModel):
     inventory_days: float = 0.0
     score: Optional[dict] = None
     advice: List[str] = Field(default_factory=list)
+    # ★ 所属チームID（任意）
+    group_id: Optional[str] = None
     created_at: str
-
-class SaveRequest(BaseModel):
-    user_id: str
-    user_name: Optional[str] = None
-    answers: List[Answer] = Field(default_factory=list)
-    scenario_path: List[dict] = Field(default_factory=list)
-    inventory_days: confloat(ge=0) = 0
-    score: Optional[dict] = None
-    advice: List[str] = Field(default_factory=list)
 
 # --------------------------------------------------------------------
 # グループ/進捗（メモリ保持）
@@ -229,7 +236,7 @@ GROUPS: Dict[str, Dict] = {}
 USERS: Dict[str, Dict] = {}
 
 # --------------------------------------------------------------------
-# 補助（JSONL 永続化）
+# JSONL 永続化（回答履歴）
 # --------------------------------------------------------------------
 RESPONSES_PATH = DATA_DIR / "responses.jsonl"
 _RESP_LOCK = Lock()
@@ -283,8 +290,9 @@ def _read_last_for_user(user_id: str) -> Optional[dict]:
     return None
 
 # --------------------------------------------------------------------
-# ルール評価
+# ルール評価（アドバイス生成）
 # --------------------------------------------------------------------
+
 def answers_to_map(answers: List[Answer]) -> Dict[str, str]:
     return {a.id.strip(): a.value.strip() for a in answers}
 
@@ -377,7 +385,7 @@ def config():
     }
 
 # --------------------------------------------------------------------
-# コンテンツAPI
+# コンテンツ API
 # --------------------------------------------------------------------
 @app.get("/scenarios")
 def scenarios(place: str = Query("gifu_gotanda")):
@@ -388,7 +396,7 @@ def quiz():
     return {"items": QUIZ.get()}
 
 # --------------------------------------------------------------------
-# 備蓄診断（数値入力：従来どおり維持）
+# 備蓄診断（数値入力）
 # --------------------------------------------------------------------
 @app.post("/inventory/analyze")
 def inventory_analyze(
@@ -495,9 +503,6 @@ def levels_score(req: ScoreRequest):
 # --------------------------------------------------------------------
 # アドバイス
 # --------------------------------------------------------------------
-def advice_rules(req: ScoreRequest) -> List[str]:
-    return pick_advices_by_rules(req, RULES.get() or [], max_items=MAX_ADVICE)
-
 @app.post("/advice")
 def advice(req: ScoreRequest, top_k: int = Query(MAX_ADVICE, ge=1, le=20)):
     actions = pick_advices_by_rules(req, RULES.get() or [], max_items=top_k)
@@ -513,7 +518,7 @@ def advice(req: ScoreRequest, top_k: int = Query(MAX_ADVICE, ge=1, le=20)):
     return {"actions": actions}
 
 # --------------------------------------------------------------------
-# グループ機能
+# グループ機能（メモリ保持）
 # --------------------------------------------------------------------
 @app.post("/groups/create")
 def create_group(name: str = Form(...)):
@@ -573,19 +578,8 @@ def group_progress(group_id: str):
     return {"group_id": group_id, "members": data}
 
 # --------------------------------------------------------------------
-# 回答・履歴 永続化
+# 回答保存 / 履歴参照
 # --------------------------------------------------------------------
-class SavedResponse(BaseModel):
-    id: str
-    user_id: str
-    user_name: Optional[str] = None
-    answers: List[dict]
-    scenario_path: List[dict] = Field(default_factory=list)
-    inventory_days: float = 0.0
-    score: Optional[dict] = None
-    advice: List[str] = Field(default_factory=list)
-    created_at: str
-
 @app.post("/responses/save")
 def responses_save(req: SaveRequest):
     rec = SavedResponse(
@@ -597,6 +591,7 @@ def responses_save(req: SaveRequest):
         inventory_days=float(req.inventory_days or 0),
         score=req.score,
         advice=req.advice or [],
+        group_id=(req.group_id or None),  # ★ 保存
         created_at=datetime.utcnow().isoformat()
     )
     _append_jsonl(rec.dict())
@@ -620,6 +615,10 @@ _app_model_lock = Lock()
 app.state.yolo_model = None  # 遅延ロード
 
 def _get_yolo_model() -> YOLO:
+    if not ENABLE_INVENTORY:
+        raise HTTPException(status_code=503, detail="Inventory analysis is disabled")
+    if not MODEL_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"Model not found: {MODEL_PATH}")
     if app.state.yolo_model is None:
         with _app_model_lock:
             if app.state.yolo_model is None:
@@ -628,11 +627,10 @@ def _get_yolo_model() -> YOLO:
                     print(f"[YOLO] Loaded model: {MODEL_PATH}")
                 except Exception as e:
                     print(f"[YOLO] Failed to load model: {e}")
-                    raise HTTPException(status_code=500, detail=f"YOLO model load failed")
+                    raise HTTPException(status_code=500, detail="YOLO model load failed")
     return app.state.yolo_model
 
 def _validate_upload(image: UploadFile):
-    # サイズ（Content-Length を信用できないケースがあるため read 後にチェック）
     ext = (Path(image.filename).suffix or "").lower()
     if ext not in ALLOWED_IMAGE_EXTS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
@@ -650,13 +648,11 @@ async def inventory_photo(
     ext = _validate_upload(image)
 
     try:
-        # 受信 → サイズ制限チェック
         content = await image.read()
         size_mb = len(content) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
             raise HTTPException(status_code=413, detail=f"File too large (> {MAX_UPLOAD_MB} MB)")
 
-        # 一時保存
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
@@ -700,3 +696,75 @@ async def inventory_photo(
 @app.post("/inventory/upload")
 async def inventory_upload(file: UploadFile = File(...)):
     return {"filename": file.filename}
+
+# --------------------------------------------------------------------
+# 管理者 API（X-Admin-Token ヘッダ必須）
+# --------------------------------------------------------------------
+
+def _require_admin(request: Request):
+    token = request.headers.get("X-Admin-Token", "")
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.get("/admin/ping")
+def admin_ping(request: Request):
+    _require_admin(request)
+    return {"ok": True, "version": APP_VERSION}
+
+@app.get("/admin/users")
+def admin_users(request: Request):
+    _require_admin(request)
+    agg = {}
+    for obj in _iter_jsonl():
+        uid = obj.get("user_id")
+        if not uid:
+            continue
+        rec = agg.get(uid, {
+            "user_id": uid,
+            "user_name": obj.get("user_name"),
+            "count": 0,
+            "last_seen": "1970-01-01T00:00:00",
+            "groups": set(),
+        })
+        rec["count"] += 1
+        ts = obj.get("created_at") or "1970-01-01T00:00:00"
+        if ts > rec["last_seen"]:
+            rec["last_seen"] = ts
+            rec["user_name"] = obj.get("user_name")
+        gid = obj.get("group_id")
+        if gid:
+            rec["groups"].add(gid)
+        agg[uid] = rec
+
+    users = []
+    for v in agg.values():
+        v["groups"] = sorted(list(v["groups"]))
+        users.append(v)
+    users.sort(key=lambda x: x["last_seen"], reverse=True)
+    return {"users": users}
+
+@app.get("/admin/responses")
+def admin_responses(
+    request: Request,
+    user_id: Optional[str] = None,
+    group_id: Optional[str] = None,
+    limit: int = 200,
+):
+    _require_admin(request)
+    out = []
+    for obj in _iter_jsonl():
+        if user_id and obj.get("user_id") != user_id:
+            continue
+        if group_id and (obj.get("group_id") or "") != group_id:
+            continue
+        out.append({
+            "created_at": obj.get("created_at"),
+            "user_id": obj.get("user_id"),
+            "user_name": obj.get("user_name"),
+            "group_id": obj.get("group_id"),
+            "answers": obj.get("answers"),
+            "advice": obj.get("advice"),
+            "score": (obj.get("score") or {}).get("score_total"),
+        })
+    out.sort(key=lambda x: x["created_at"], reverse=True)
+    return out[:max(1, min(limit, 1000))]
