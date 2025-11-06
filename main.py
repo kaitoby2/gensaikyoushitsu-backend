@@ -389,8 +389,21 @@ def config():
 # --------------------------------------------------------------------
 @app.get("/scenarios")
 def scenarios(place: str = Query("gifu_gotanda")):
-    return SCENARIOS.get()
+    # 何があっても {"items": [...]} を返すように正規化
+    data = SCEN_CACHE.get(place)
 
+    # キャッシュに無い、または None/不正形なら再読込
+    if not isinstance(data, dict) or not data:
+        loaded = load_scenarios(place) or {}
+        # 形をそろえる（itemsが無い・不正なら空配列にする）
+        items = loaded.get("items")
+        if not isinstance(items, list):
+            loaded = {"items": []}
+        SCEN_CACHE[place] = loaded
+        data = loaded
+
+    return data  # 必ず {"items": [...]} になる
+  
 @app.get("/quiz")
 def quiz():
     return {"items": QUIZ.get()}
