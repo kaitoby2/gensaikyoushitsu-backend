@@ -98,12 +98,12 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 # CORS → 先に適用
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS,
-    allow_credentials=CORS_ALLOW_CREDENTIALS,
+    allow_origins=["https://gensaikyoushitsu-frontend.onrender.com"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
+
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
 # 静的配信（存在するものだけマウント）
@@ -183,15 +183,15 @@ def _get_stock() -> dict:
 # ---- シナリオ読み込み（placeごと） ----
 SCEN_CACHE: Dict[str, dict] = {}
 
+SCEN_CACHE: Dict[str, dict] = {}
+
 def load_scenarios(place: str) -> dict:
-    """
-    data/scenarios_{place}.json を読み込み、常に {"items":[...]} を返す。
-    ファイルが無い／壊れている場合は {"items": []}。
-    """
     p = DATA_DIR / f"scenarios_{place}.json"
     try:
         with p.open("r", encoding="utf-8") as f:
             raw = json.load(f)
+        items = raw.get("items")
+        return {"items": items if isinstance(items, list) else []}
     except Exception as e:
         print(f"[scenarios] load failed: {p} ({e})")
         return {"items": []}
@@ -654,7 +654,7 @@ def responses_history(user_id: str, limit: int = 50):
 _app_model_lock = Lock()
 app.state.yolo_model = None  # 遅延ロード
 
-def _get_yolo_model() -> "YOLO":  # ← from __future__ import annotations があるので文字列でOK
+def _get_yolo_model() -> "YOLO":
     if not ENABLE_INVENTORY:
         raise HTTPException(status_code=503, detail="Inventory analysis is disabled")
     if not MODEL_PATH.exists():
@@ -663,8 +663,7 @@ def _get_yolo_model() -> "YOLO":  # ← from __future__ import annotations が�
         with _app_model_lock:
             if app.state.yolo_model is None:
                 try:
-                    # ここで初めて import（無い環境でも起動は成功する）
-                    from ultralytics import YOLO  # noqa
+                    from ultralytics import YOLO  # ← ここで初めてimport
                     app.state.yolo_model = YOLO(MODEL_PATH)
                     print(f"[YOLO] Loaded model: {MODEL_PATH}")
                 except Exception as e:
@@ -741,7 +740,6 @@ async def inventory_upload(file: UploadFile = File(...)):
 
 @app.options("/{rest_of_path:path}")
 def any_options(rest_of_path: str):
-    # CORSMiddleware が自動でヘッダ付けるので 200 を返すだけでよい
     return JSONResponse({"ok": True})
 
 # --------------------------------------------------------------------
