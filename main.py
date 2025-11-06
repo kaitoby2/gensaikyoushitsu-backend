@@ -67,7 +67,7 @@ CORS_ALLOW_CREDENTIALS = os.environ.get("CORS_ALLOW_CREDENTIALS", "true").lower(
 
 # --- 画像診断モデル（ONNX/PT） ---
 ENABLE_INVENTORY    = os.environ.get("ENABLE_INVENTORY", "0") == "1"  # 既定は OFF
-WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", str(BASE_DIR / "models" / "best.onnx"))
+WATER_BOTTLE_MODEL  = os.environ.get("WATER_BOTTLE_MODEL", str(BASE_DIR / "models" / "best.pt"))
 MODEL_PATH          = Path(WATER_BOTTLE_MODEL).resolve()
 if ENABLE_INVENTORY and not MODEL_PATH.exists():
     print(f"[inventory] model not found: {MODEL_PATH} → disabling inventory")
