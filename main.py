@@ -98,13 +98,18 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 # CORS → 先に適用
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://gensaikyoushitsu-frontend.onrender.com"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
-
 app.add_middleware(GZipMiddleware, minimum_size=512)
+
+# ★ プリフライト（OPTIONS）を必ず 200 にする
+@app.options("/{rest_of_path:path}")
+def any_options(rest_of_path: str):
+    return JSONResponse({"ok": True})
 
 # 静的配信（存在するものだけマウント）
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -118,18 +123,21 @@ RESULTS_DIR = STATIC_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # --------------------------------------------------------------------
-# 例外ハンドラ
+# 例外ハンドラ（HTTP はそのまま、未知は 500）
 # --------------------------------------------------------------------
+from fastapi import HTTPException  # 既に import 済みなら不要
 
-# HTTPエラーはそのまま返す（デフォルト動作に近い形）
-@app.exception_handler(StarletteHTTPException)
-async def _http_exc_handler(_: Request, exc: StarletteHTTPException):
+@app.exception_handler(HTTPException)
+async def _http_exc(_: Request, exc: HTTPException):
+    # バリデーション/認可エラー等は素のステータスで返す（デバッグしやすく）
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
-# 想定外エラーだけ500でまとめる
 @app.exception_handler(Exception)
 async def _unhandled_exc(_: Request, exc: Exception):
-    print(f"[ERROR] {exc!r}")
+    try:
+        print(f"[ERROR] {exc!r}")
+    except Exception:
+        pass
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
   
 # --------------------------------------------------------------------
@@ -262,6 +270,29 @@ class SavedResponse(BaseModel):
 GROUPS: Dict[str, Dict] = {}
 USERS: Dict[str, Dict] = {}
 
+# ★ ここから追加：GROUPS/USERS の簡易永続化
+STATE_DIR = DATA_DIR
+GROUPS_PATH = STATE_DIR / "groups.json"
+USERS_PATH  = STATE_DIR / "users.json"
+
+def _save_groups_users():
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        GROUPS_PATH.write_text(json.dumps(GROUPS, ensure_ascii=False), encoding="utf-8")
+        USERS_PATH.write_text(json.dumps(USERS,  ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print("[state][save] failed:", e)
+
+def _load_groups_users():
+    global GROUPS, USERS
+    try:
+        if GROUPS_PATH.exists():
+            GROUPS = json.loads(GROUPS_PATH.read_text(encoding="utf-8"))
+        if USERS_PATH.exists():
+            USERS = json.loads(USERS_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        print("[state][load] failed:", e)
+
 # --------------------------------------------------------------------
 # JSONL 永続化（回答履歴）
 # --------------------------------------------------------------------
@@ -315,6 +346,9 @@ def _read_last_for_user(user_id: str) -> Optional[dict]:
     except Exception:
         pass
     return None
+
+# ★ 起動時に前回のチーム状態を復元
+_load_groups_users()
 
 # --------------------------------------------------------------------
 # ルール評価（アドバイス生成）
@@ -404,8 +438,9 @@ def version():
 def config():
     return {
         "cors": CORS_ALLOW_ORIGINS,
-        "data_dir": str(DATA_DIR),            # ← 追加
         "static": str(STATIC_DIR),
+        "data_dir": str(DATA_DIR),               # ★ 追加
+        "responses_path": str(RESPONSES_PATH),   # ★ 追加
         "unity_mounted": UNITY_DIR.exists(),
         "frontend_mounted": FRONTEND_DIR.exists(),
         "max_upload_mb": MAX_UPLOAD_MB,
@@ -564,6 +599,7 @@ def advice(req: ScoreRequest, top_k: int = Query(MAX_ADVICE, ge=1, le=20)):
 def create_group(name: str = Form(...)):
     group_id = str(uuid.uuid4())[:8]
     GROUPS[group_id] = {"name": name, "members": []}
+    _save_groups_users()  # ★ 追加
     return {"group_id": group_id, "invite_code": group_id}
 
 @app.post("/groups/join")
@@ -581,6 +617,7 @@ def join_group(
             USERS[user_id]["name"] = user_name
     if user_id not in GROUPS[group_id]["members"]:
         GROUPS[group_id]["members"].append(user_id)
+    _save_groups_users()  # ★ 追加
     return {"message": "Joined group", "group_id": group_id}
 
 @app.post("/progress/update")
@@ -593,6 +630,7 @@ def update_progress(p: Progress):
         prev["name"] = data["user_name"]
     prev["progress"] = data
     USERS[p.user_id] = prev
+    _save_groups_users()  # ★ 追加
     return {"message": "Progress updated"}
 
 @app.get("/groups/{group_id}/progress")
