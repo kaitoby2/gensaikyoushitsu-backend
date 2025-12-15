@@ -238,6 +238,13 @@ class Progress(BaseModel):
     score: Optional[int] = None
     rank: Optional[str] = None
     advice: List[AdviceItem] = Field(default_factory=list)
+
+    # ★追加：実行するアドバイス（文字列で持つ）
+    selected_advice: List[str] = Field(default_factory=list)
+
+    # ★追加：どう達成するか（自由記述）
+    plan_text: Optional[str] = None
+
     last_updated: Optional[str] = None
 
 class SaveRequest(BaseModel):
@@ -651,6 +658,8 @@ def group_progress(group_id: str):
                 "score": None,
                 "rank": None,
                 "advice": [],
+                "selected_advice": [],   # ★追加
+                "plan_text": None,       # ★追加
                 "last_updated": None,
             })
     return {"group_id": group_id, "members": data}
