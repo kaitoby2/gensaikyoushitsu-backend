@@ -263,25 +263,25 @@
     "cond": "depth>=1.5",
     "advice": "浸水深1.5mは大人の胸ほどの高さになり、自力で歩くのは非常に危険です。すぐに高い場所への避難を考えましょう。早期避難するほど命を守れる可能性が高まります。",
     "priority": 5,
-    "level": "critical"
+    "level": "intermediate"
   },
   {
     "cond": "depth>0.5 and depth<1.5",
     "advice": "浸水深0.5mを超えると、車の走行や歩行が難しくなります。無理に移動せず、安全な場所へルートを慎重に選びましょう。危険な場所を避けるだけで事故のリスクを大幅に減らせます。",
-    "priority": 4,
-    "level": "warning"
+    "priority": 5,
+    "level": "intermediate"
   },
 
   {
     "cond": "inventory_days<1",
     "advice": "備蓄が1日未満だと災害直後に生活が立ち行かなくなります。最低3日分、できれば1週間分の水と食料をそろえましょう。備蓄が増えるほど“避難の判断に集中できる余裕”が生まれます。",
-    "priority": 5,
-    "level": "critical"
+    "priority": 1,
+    "level": "intermediate"
   },
   {
     "cond": "inventory_days>=1 and inventory_days<3",
     "advice": "備蓄が少しあるのは良いことです。あと数日分そろえるだけで、災害直後の買い物難民を避けられ、安全に在宅避難できる可能性が高まります。",
-    "priority": 4,
-    "level": "warning"
+    "priority": 1,
+    "level": "intermediate"
   }
 ]
