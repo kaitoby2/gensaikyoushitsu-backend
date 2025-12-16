@@ -402,6 +402,7 @@ def evaluate_beginner_flag(cond: str, answers: List[Answer]) -> bool:
 def pick_advices_by_rules(req: ScoreRequest, rules: List[dict], max_items: int = MAX_ADVICE) -> List[str]:
     amap = answers_to_map(req.answers)
     ctx = {"depth": float(req.flood_depth_m or 0), "inventory_days": float(req.inventory_days or 0)}
+
     matched: List[dict] = []
     for r in rules:
         cond = (r.get("cond") or "").strip()
@@ -412,7 +413,36 @@ def pick_advices_by_rules(req: ScoreRequest, rules: List[dict], max_items: int =
         )
         if ok:
             matched.append(r)
-    matched.sort(key=lambda x: int(x.get("priority", 0)), reverse=True)
+
+    # ===== ここから追加（matched.sort の直前に入れる）=====
+    # level の優先順：初級→中級→上級（JSONに英語/日本語が混在してもOK）
+    level_order = {
+        "beginner": 0, "初級": 0,
+        "intermediate": 1, "中級": 1,
+        "advanced": 2, "上級": 2,
+    }
+
+    # 同じ設問なら no を some より先に出したい（任意）
+    def severity_key(rule: dict) -> int:
+        c = (rule.get("cond") or "").strip().lower()
+        if "=no" in c:
+            return 0
+        if "=some" in c:
+            return 1
+        return 2
+
+    # 並べ替えキー：level→priority（1→2→3）→ no優先
+    def sort_key(rule: dict):
+        lv = (rule.get("level") or "").strip()
+        lv_rank = level_order.get(lv, 99)      # levelが無い/未知なら最後
+        pr = int(rule.get("priority", 999))    # priorityが無いなら最後
+        return (lv_rank, pr, severity_key(rule))
+    # ===== 追加ここまで =====
+
+    # ===== この1行を置き換え =====
+    # 旧：matched.sort(key=lambda x: int(x.get("priority", 0)), reverse=True)
+    matched.sort(key=sort_key)
+
     out, seen = [], set()
     for r in matched:
         adv = r.get("advice")
